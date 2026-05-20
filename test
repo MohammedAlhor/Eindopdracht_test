@@ -1,1 +1,320 @@
-find . -maxdepth 1 -mindepth 1 ! -name "ChatAPG_Backend" ! -name "_OLD_ROOT_BACKUP" -exec mv -t _OLD_ROOT_BACKUP {} +
+import os
+import re
+import time
+import json
+import asyncio
+import pandas as pd
+from pprint import pprint
+
+from langchain.messages import HumanMessage
+
+from application.models.chat_model import get_chat_model
+from application.vectordatabase.utils.util_functions import load_config
+from backend.graph import build_rag_agent
+
+
+# ========================================================
+# INSTELLINGEN
+# ========================================================
+
+OUTPUT_DIR = "output_files"
+
+INPUT_FILE = f"{OUTPUT_DIR}/evaluation_questions.csv"
+OUTPUT_FILE = f"{OUTPUT_DIR}/rag_evaluation_results.csv"
+
+# Zet op True als je tijdens het draaien meer info wilt zien
+DEBUG = True
+
+# Houd dit pragmatisch: standaard dezelfde RAG-flow als de werkende app
+USE_COMBINED_MODEL = True
+ENABLE_PHOENIX = True
+
+
+# ========================================================
+# HELPERS
+# ========================================================
+
+def ensure_output_dir():
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+
+def normalize_text(value) -> str:
+    if pd.isna(value):
+        return ""
+
+    value = str(value)
+    value = value.replace("\n", " ")
+    value = value.replace("\r", " ")
+    value = re.sub(r"\s+", " ", value)
+
+    return value.strip()
+
+
+def safe_get(row, column_name, default=""):
+    """
+    Voorkomt errors als een kolom niet bestaat.
+    Handig omdat collega's soms net andere CSV's gebruiken.
+    """
+    if column_name in row:
+        return row[column_name]
+    return default
+
+
+def simple_keyword_score(expected_answer: str, actual_answer: str) -> float:
+    """
+    Simpele pragmatische score.
+    Niet bedoeld als wetenschappelijke metric, wel handig om snel te sorteren
+    op vragen waar het antwoord waarschijnlijk slecht is.
+    """
+    expected_answer = normalize_text(expected_answer).lower()
+    actual_answer = normalize_text(actual_answer).lower()
+
+    words = [
+        word.strip(".,;:!?()[]{}\"'")
+        for word in expected_answer.split()
+    ]
+
+    words = [
+        word for word in words
+        if len(word) > 3
+    ]
+
+    if not words:
+        return 0.0
+
+    hits = [
+        word for word in words
+        if word in actual_answer
+    ]
+
+    return round(len(hits) / len(words), 3)
+
+
+def get_answer_from_result(result) -> str:
+    """
+    Probeert het antwoord uit de output van de RAG-agent te halen.
+    Werkt voor de gebruikelijke LangGraph/LangChain structuur:
+    result["messages"][-1].content
+    """
+    if result is None:
+        return ""
+
+    try:
+        if isinstance(result, dict):
+            messages = result.get("messages", [])
+
+            if messages:
+                last_message = messages[-1]
+
+                if hasattr(last_message, "content"):
+                    return str(last_message.content)
+
+                if isinstance(last_message, dict):
+                    return str(last_message.get("content", ""))
+
+        return str(result)
+
+    except Exception:
+        return str(result)
+
+
+def get_raw_sources_from_result(result) -> str:
+    """
+    Probeert eventuele bronnen/metadata uit de agent output te halen.
+    Als de graph dit niet teruggeeft, blijft deze kolom leeg.
+    """
+    try:
+        if not isinstance(result, dict):
+            return ""
+
+        possible_source_keys = [
+            "sources",
+            "documents",
+            "context",
+            "retrieved_documents",
+            "source_documents"
+        ]
+
+        found = {}
+
+        for key in possible_source_keys:
+            if key in result:
+                found[key] = result[key]
+
+        if not found:
+            return ""
+
+        return json.dumps(found, ensure_ascii=False, default=str)
+
+    except Exception:
+        return ""
+
+
+def load_questions() -> pd.DataFrame:
+    print("Loading evaluation questions")
+
+    if not os.path.exists(INPUT_FILE):
+        raise FileNotFoundError(
+            f"Input file not found: {INPUT_FILE}"
+        )
+
+    questions = pd.read_csv(INPUT_FILE)
+
+    if "question" not in questions.columns:
+        raise ValueError(
+            "De CSV moet minimaal een kolom 'question' hebben."
+        )
+
+    if "id" not in questions.columns:
+        questions.insert(0, "id", range(1, len(questions) + 1))
+
+    if "expected_answer" not in questions.columns:
+        questions["expected_answer"] = ""
+
+    for col in questions.columns:
+        questions[col] = questions[col].apply(normalize_text)
+
+    print(f"Loaded {len(questions)} evaluation questions")
+
+    return questions
+
+
+def print_config_check():
+    """
+    Alleen bedoeld als korte sanity check.
+    We initialiseren hier NIET zelf de vector database.
+    """
+    if not DEBUG:
+        return
+
+    try:
+        config = load_config(os.environ["CONFIG"])
+
+        print("Config loaded")
+
+        if "vectordatabase" in config:
+            print("Vectordatabase config:")
+            pprint(config["vectordatabase"])
+        else:
+            print("Geen 'vectordatabase' key gevonden in config")
+
+    except Exception as e:
+        print("Config kon niet worden geprint:")
+        print(str(e))
+
+
+# ========================================================
+# EVALUATION
+# ========================================================
+
+async def run_evaluation(questions: pd.DataFrame) -> pd.DataFrame:
+    print("Starting RAG evaluation")
+
+    print_config_check()
+
+    print("Initializing chat model")
+    chat_model = get_chat_model()
+
+    print("Building RAG agent")
+    agent = build_rag_agent(
+        chat_model,
+        use_combined_model=USE_COMBINED_MODEL,
+        enable_phoenix=ENABLE_PHOENIX
+    )
+
+    print("RAG agent ready")
+
+    results = []
+
+    for index, row in questions.iterrows():
+        question_id = safe_get(row, "id", index + 1)
+        question = safe_get(row, "question", "")
+        expected_answer = safe_get(row, "expected_answer", "")
+
+        topic = safe_get(row, "topic", "")
+        expected_source = safe_get(row, "expected_source", "")
+        fonds = safe_get(row, "fonds", "")
+        kennisbank = safe_get(row, "kennisbank", "")
+        k = safe_get(row, "k", "")
+
+        print(f"Running question {question_id}: {question[:80]}")
+
+        start_time = time.time()
+
+        actual_answer = ""
+        raw_sources = ""
+        raw_result = ""
+        error = ""
+
+        try:
+            result = await agent.ainvoke({
+                "messages": [
+                    HumanMessage(content=question)
+                ]
+            })
+
+            actual_answer = normalize_text(
+                get_answer_from_result(result)
+            )
+
+            raw_sources = get_raw_sources_from_result(result)
+
+            raw_result = json.dumps(
+                result,
+                ensure_ascii=False,
+                default=str
+            )
+
+        except Exception as e:
+            error = str(e)
+            print(f"Error bij question {question_id}: {error}")
+
+        latency_seconds = round(time.time() - start_time, 3)
+
+        keyword_score = simple_keyword_score(
+            expected_answer=expected_answer,
+            actual_answer=actual_answer
+        )
+
+        results.append({
+            "id": question_id,
+            "topic": topic,
+            "question": question,
+            "expected_answer": expected_answer,
+            "actual_answer": actual_answer,
+            "expected_source": expected_source,
+            "fonds": fonds,
+            "kennisbank": kennisbank,
+            "k": k,
+            "keyword_score": keyword_score,
+            "latency_seconds": latency_seconds,
+            "error": error,
+            "raw_sources": raw_sources,
+            "raw_result": raw_result
+        })
+
+        # Tussentijds opslaan, pragmatisch:
+        # als de run halverwege klapt, ben je niet alles kwijt.
+        pd.DataFrame(results).to_csv(OUTPUT_FILE, index=False)
+
+    return pd.DataFrame(results)
+
+
+def main():
+    ensure_output_dir()
+
+    questions = load_questions()
+
+    results = asyncio.run(
+        run_evaluation(questions)
+    )
+
+    results.to_csv(OUTPUT_FILE, index=False)
+
+    print("Finished RAG evaluation")
+    print(f"Saved results to: {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()
