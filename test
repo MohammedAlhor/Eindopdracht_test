@@ -1,12 +1,12 @@
 import os
 import re
-import time
 import json
+import time
 import asyncio
 import pandas as pd
 from pprint import pprint
 
-from langchain.messages import HumanMessage
+from langchain.messages import HumanMessage, AIMessage
 
 from application.models.chat_model import get_chat_model
 from application.vectordatabase.utils.util_functions import load_config
@@ -22,12 +22,13 @@ OUTPUT_DIR = "output_files"
 INPUT_FILE = f"{OUTPUT_DIR}/evaluation_questions.csv"
 OUTPUT_FILE = f"{OUTPUT_DIR}/rag_evaluation_results.csv"
 
-# Zet op True als je tijdens het draaien meer info wilt zien
-DEBUG = True
-
-# Houd dit pragmatisch: standaard dezelfde RAG-flow als de werkende app
 USE_COMBINED_MODEL = True
 ENABLE_PHOENIX = True
+
+# Belangrijk:
+# True = werkt hetzelfde als test_agent.py, dus history blijft bestaan tijdens de run
+# False = elke vraag wordt los getest
+USE_CONVERSATION_HISTORY = True
 
 
 # ========================================================
@@ -51,22 +52,38 @@ def normalize_text(value) -> str:
     return value.strip()
 
 
-def safe_get(row, column_name, default=""):
+def extract_and_concat_text(json_string: str) -> str:
     """
-    Voorkomt errors als een kolom niet bestaat.
-    Handig omdat collega's soms net andere CSV's gebruiken.
+    Zelfde werkwijze als in test_agent.py.
+
+    De RAG-agent geeft soms content terug als JSON-achtige tekst:
+    [{"type":"text","text":"..."}]
+
+    Deze functie haalt daar alleen de daadwerkelijke tekst uit.
     """
-    if column_name in row:
-        return row[column_name]
-    return default
+    if not json_string:
+        return ""
+
+    try:
+        json_string = str(json_string)
+
+        pattern = r'"text"\s*:\s*"((?:\\.|[^"\\])*)"'
+        matches = re.findall(pattern, json_string)
+
+        if matches:
+            cleaned = [
+                bytes(m, "utf-8").decode("unicode_escape")
+                for m in matches
+            ]
+            return " ".join(cleaned).strip()
+
+        return json_string.strip()
+
+    except Exception:
+        return str(json_string)
 
 
 def simple_keyword_score(expected_answer: str, actual_answer: str) -> float:
-    """
-    Simpele pragmatische score.
-    Niet bedoeld als wetenschappelijke metric, wel handig om snel te sorteren
-    op vragen waar het antwoord waarschijnlijk slecht is.
-    """
     expected_answer = normalize_text(expected_answer).lower()
     actual_answer = normalize_text(actual_answer).lower()
 
@@ -91,80 +108,34 @@ def simple_keyword_score(expected_answer: str, actual_answer: str) -> float:
     return round(len(hits) / len(words), 3)
 
 
+def safe_get(row, column_name, default=""):
+    if column_name in row:
+        return row[column_name]
+    return default
+
+
 def get_answer_from_result(result) -> str:
     """
-    Probeert het antwoord uit de output van de RAG-agent te halen.
-    Werkt voor de gebruikelijke LangGraph/LangChain structuur:
+    Haalt het antwoord uit dezelfde plek als test_agent.py:
     result["messages"][-1].content
     """
-    if result is None:
-        return ""
-
     try:
-        if isinstance(result, dict):
-            messages = result.get("messages", [])
-
-            if messages:
-                last_message = messages[-1]
-
-                if hasattr(last_message, "content"):
-                    return str(last_message.content)
-
-                if isinstance(last_message, dict):
-                    return str(last_message.get("content", ""))
-
-        return str(result)
-
+        content = result["messages"][-1].content
+        return extract_and_concat_text(content)
     except Exception:
-        return str(result)
-
-
-def get_raw_sources_from_result(result) -> str:
-    """
-    Probeert eventuele bronnen/metadata uit de agent output te halen.
-    Als de graph dit niet teruggeeft, blijft deze kolom leeg.
-    """
-    try:
-        if not isinstance(result, dict):
-            return ""
-
-        possible_source_keys = [
-            "sources",
-            "documents",
-            "context",
-            "retrieved_documents",
-            "source_documents"
-        ]
-
-        found = {}
-
-        for key in possible_source_keys:
-            if key in result:
-                found[key] = result[key]
-
-        if not found:
-            return ""
-
-        return json.dumps(found, ensure_ascii=False, default=str)
-
-    except Exception:
-        return ""
+        return extract_and_concat_text(str(result))
 
 
 def load_questions() -> pd.DataFrame:
     print("Loading evaluation questions")
 
     if not os.path.exists(INPUT_FILE):
-        raise FileNotFoundError(
-            f"Input file not found: {INPUT_FILE}"
-        )
+        raise FileNotFoundError(f"Input file not found: {INPUT_FILE}")
 
     questions = pd.read_csv(INPUT_FILE)
 
     if "question" not in questions.columns:
-        raise ValueError(
-            "De CSV moet minimaal een kolom 'question' hebben."
-        )
+        raise ValueError("De CSV moet minimaal een kolom 'question' hebben.")
 
     if "id" not in questions.columns:
         questions.insert(0, "id", range(1, len(questions) + 1))
@@ -181,13 +152,6 @@ def load_questions() -> pd.DataFrame:
 
 
 def print_config_check():
-    """
-    Alleen bedoeld als korte sanity check.
-    We initialiseren hier NIET zelf de vector database.
-    """
-    if not DEBUG:
-        return
-
     try:
         config = load_config(os.environ["CONFIG"])
 
@@ -196,8 +160,6 @@ def print_config_check():
         if "vectordatabase" in config:
             print("Vectordatabase config:")
             pprint(config["vectordatabase"])
-        else:
-            print("Geen 'vectordatabase' key gevonden in config")
 
     except Exception as e:
         print("Config kon niet worden geprint:")
@@ -227,6 +189,9 @@ async def run_evaluation(questions: pd.DataFrame) -> pd.DataFrame:
 
     results = []
 
+    # Zelfde idee als test_agent.py
+    history = []
+
     for index, row in questions.iterrows():
         question_id = safe_get(row, "id", index + 1)
         question = safe_get(row, "question", "")
@@ -238,27 +203,43 @@ async def run_evaluation(questions: pd.DataFrame) -> pd.DataFrame:
         kennisbank = safe_get(row, "kennisbank", "")
         k = safe_get(row, "k", "")
 
-        print(f"Running question {question_id}: {question[:80]}")
+        print(f"Running question {question_id}: {question[:100]}")
 
         start_time = time.time()
 
         actual_answer = ""
-        raw_sources = ""
-        raw_result = ""
         error = ""
+        raw_result = ""
 
         try:
-            result = await agent.ainvoke({
-                "messages": [
+            if USE_CONVERSATION_HISTORY:
+                # Exact zoals test_agent.py:
+                # bestaande history behouden en nieuwe vraag toevoegen
+                history.append(HumanMessage(content=question))
+
+                result = await agent.ainvoke({
+                    "messages": history
+                })
+
+                actual_answer = normalize_text(
+                    get_answer_from_result(result)
+                )
+
+                history.append(AIMessage(content=actual_answer))
+
+            else:
+                # Losse vraag, zonder eerdere context
+                local_history = [
                     HumanMessage(content=question)
                 ]
-            })
 
-            actual_answer = normalize_text(
-                get_answer_from_result(result)
-            )
+                result = await agent.ainvoke({
+                    "messages": local_history
+                })
 
-            raw_sources = get_raw_sources_from_result(result)
+                actual_answer = normalize_text(
+                    get_answer_from_result(result)
+                )
 
             raw_result = json.dumps(
                 result,
@@ -290,12 +271,10 @@ async def run_evaluation(questions: pd.DataFrame) -> pd.DataFrame:
             "keyword_score": keyword_score,
             "latency_seconds": latency_seconds,
             "error": error,
-            "raw_sources": raw_sources,
             "raw_result": raw_result
         })
 
-        # Tussentijds opslaan, pragmatisch:
-        # als de run halverwege klapt, ben je niet alles kwijt.
+        # Tussentijds opslaan, zodat je niks kwijt bent als hij halverwege faalt
         pd.DataFrame(results).to_csv(OUTPUT_FILE, index=False)
 
     return pd.DataFrame(results)
