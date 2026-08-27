@@ -1,323 +1,147 @@
-import os
-from langchain_openai.chat_models import AzureChatOpenAI
-from application.vectordatabase.utils.util_functions import load_config, get_auth_token
-config = load_config(os.environ['CONFIG'])
-
-def get_chat_model():
-    """ Returns OpenAI chat model """
-    return  AzureChatOpenAI(
-        azure_endpoint=config['openai']['chat_model']['endpoint'],
-        azure_deployment=config['openai']['chat_model']['deployment_id'],
-        azure_ad_token_provider= lambda: get_auth_token(config),  
-        api_version=config['openai']['chat_model']['api_version'],
-        openai_api_type=config['openai']['chat_model']['api_type'],
-        temperature=0
-        )
-
-
-
-utils:
-import os
+import re
 
 from application.models.chat_model import get_chat_model
-from application.vectordatabase.src.database.vector_database import Vectordatabase
-from application.vectordatabase.utils.util_functions import load_config
 
-from langchain.schema import HumanMessage, AIMessage, SystemMessage
-from fastapi import HTTPException
-import json
-import logging
-import re
-from backend.llm_validation import (
-    validate_summarize_response,
-    validate_rewrite_response, 
-    validate_retrieve_answer_response,
-    create_context_from_subchunks,
-    chunk_text_with_overlap_and_positions,
-    chunk_text_by_sentences,
-    validate_footnote_references,
-    get_display_text_for_subchunk_matches
+
+PROJECT_INPUT = {
+    "title": "Fictieve pensioenpercentages 2026",
+    "source_page": "demo://pensioen-2026",
+    "section": "Premies 2026",
+    "table_id": "table-premies-2026",
+    "table_title": "Premiepercentages 2026",
+    "column_count": 4,
+    "text_before": "De percentages gelden vanaf 1 januari 2026.",
+    "content": """Regeling | OP 2026 | RP 2026 | Totaal 2026 |
+Regeling A | 22,00% | 3,93% | 25,93% |
+Regeling B | 22,00% | 3,73% | 25,73% |
+Regeling C | 24,00% | | 24,00% |
+Regeling D | 21,00% | - | 21,00% |
+Regeling E | 20,00% | 3,20% | 23,20% |""".replace("\n", " "),
+    "text_after": "Een streepje is niet hetzelfde als nul of een lege cel.",
+}
+
+QUESTION = (
+    "Wat is RP 2026 voor Regeling B? Vergelijk daarna het totaal van Regeling B "
+    "met Regeling E. Leg ook uit wat bij RP 2026 voor Regeling C staat."
 )
 
-logging.basicConfig(
-    filename='app.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
 
-logger = logging.getLogger(__name__)
+def _split_values(text):
+    stripped = text.strip()
+    values = [value.strip() for value in stripped.split("|")]
+    if stripped.startswith("|") and values[0] == "":
+        values.pop(0)
+    if stripped.endswith("|") and values[-1] == "":
+        values.pop()
+    return values
 
 
-config = load_config(os.environ['CONFIG'])
+def parse_flattened_table(content, column_count):
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("content must be a non-empty string")
+    if not isinstance(column_count, int) or column_count < 2:
+        raise ValueError("column_count must be an integer of at least 2")
 
-chat_model = get_chat_model()
+    lines = [line for line in content.splitlines() if line.strip()]
+    if len(lines) > 1:
+        values_per_line = [_split_values(line) for line in lines]
+        if any(len(values) != column_count for values in values_per_line):
+            raise ValueError("each table row must contain column_count values")
+        headers = values_per_line[0]
+        rows = values_per_line[1:]
+    else:
+        values = _split_values(content)
+        if len(values) < column_count * 2 or len(values) % column_count:
+            raise ValueError("flattened table does not match column_count")
+        headers = values[:column_count]
+        rows = [
+            values[index : index + column_count]
+            for index in range(column_count, len(values), column_count)
+        ]
 
-#Initialiseer vectordatabase
-path = config['sharepoint']['db_path']
-#path = vervang met path waar je de database zet
-vector_db = Vectordatabase(db_path=path, collection_name="Kennisbank")
+    separator = re.compile(r"^:?-{3,}:?$")
+    if rows and all(separator.fullmatch(value) for value in rows[0]):
+        rows = rows[1:]
+    if not rows:
+        raise ValueError("table must contain at least one data row")
+    return headers, rows
 
-prompt_rewrite_question = """
-Rewrite the MOST RECENT QUESTION into a STANDALONE QUESTION in its original language (Dutch) using the rest of the chat as CONTEXT.
 
-You put the answer in markdown within a JSON object with the following format:
-{
-  "standalone_question": "<your written stand alone question>"
-}
+def build_row_nodes(project_input):
+    headers, rows = parse_flattened_table(
+        project_input["content"],
+        project_input["column_count"],
+    )
+    nodes = []
+    for row_index, values in enumerate(rows):
+        cells = [
+            {
+                "node_id": f"{project_input['table_id']}-r{row_index}-c{column_index}",
+                "column_index": column_index,
+                "column_name": headers[column_index],
+                "raw_value": value,
+                "missing": value == "",
+            }
+            for column_index, value in enumerate(values)
+        ]
+        displayed_values = ["—" if value == "" else value for value in values]
+        markdown = "\n".join(
+            [
+                "| " + " | ".join(headers) + " |",
+                "| " + " | ".join("---" for _ in headers) + " |",
+                "| " + " | ".join(displayed_values) + " |",
+            ]
+        )
+        nodes.append(
+            {
+                "node_id": f"{project_input['table_id']}-r{row_index}",
+                "node_type": "table_row",
+                "table_id": project_input["table_id"],
+                "row_index": row_index,
+                "cells": cells,
+                "content": (
+                    f"Document: {project_input['title']}\n"
+                    f"Sectie: {project_input['section']}\n"
+                    f"Tabel: {project_input['table_title']}\n\n"
+                    f"{markdown}"
+                ),
+            }
+        )
+    return nodes
 
-Always put your standalone question in a JSON object. Only output the JSON object, nothing else.
 
-### Example Output:
-```json
-{
-  "standalone_question": "Wat is de hoofdstad van Frankrijk?"
-}
+def build_prompt(project_input, row_nodes, question):
+    rows = "\n\n".join(node["content"] for node in row_nodes)
+    return f"""Beantwoord de vraag uitsluitend met de bron hieronder.
+Een tabelwaarde — betekent dat de oorspronkelijke cel leeg was en geen waarde vermeldde.
+Een waarde 0 is nul. Een waarde - is een letterlijk streepje uit de bron.
 
+Tekst vóór de tabel:
+{project_input['text_before']}
+
+Tabelrijen:
+{rows}
+
+Tekst na de tabel:
+{project_input['text_after']}
+
+Vraag:
+{question}
 """
 
-prompt_retrieve_answer = """
-Your task is to provide an answer to the user query. In answering the user's query, use exclusively the content from the provided CONTEXT or the conversation history, adhering to specific terminology.
-The CONTEXT is in a json object that contains documents, and each document is split into subchunks. Each subchunk has a document_id and a subchunk_id.
-If you cannot find an answer from the provided CONTEXT or the CONVERSATION HISTORY, your answer be an empty string.
 
-You put the answer in markdown within a JSON object with the following format:
-{
-"answer": "<your answer here in markdown>",
-"status_code": "<your status code>"
-}
+def main():
+    row_nodes = build_row_nodes(PROJECT_INPUT)
 
-where the status code is one of the following:
-    If you cannot find an answer from using the provided CONTEXT or the CONVERSATION HISTORY, provide the following status code: "LLM_NO_ANSWER"
-    If you are able to provide an answer without asking for extra context, provide the following status code: "LLM_SUCCESS".
+    assert row_nodes[2]["cells"][2]["raw_value"] == ""
+    assert row_nodes[2]["cells"][2]["missing"] is True
+    assert row_nodes[3]["cells"][2]["raw_value"] == "-"
+    assert row_nodes[3]["cells"][2]["missing"] is False
 
-Extra instructions for your answer:
-    For every factual claim or statement you make, you must include an inline citation immediately after the claim from the CONTEXT. Use the format [document_id:subchunk_id]. If you need multiple subchunks to support a claim, use multiple inline citations (eg. [document_1:subchunk_1] [document_1:subchunk_2]). Do not group citations at the end of the answer. Instead distribute them throughout the reponse so that each claim is clearly backed by a subchunk.
-    Use bullet lists wherever possible and always answer in Dutch.
-    You take a step-by-step approach in your answer, give reasoning and include details (like timelines, processes, entities, amounts, requirements and exceptions).
-
-Always put your answer (in markdown format) and the status code in a JSON object. Only output the JSON object, nothing else.
-
-Example Output:
-
-{
-  "answer": "Zonnenpanelen zijn het meest efficient wanneer ze naar het zuiden zijn gericht. [234564:12] Ze gaan ook slechter werken na verloop van tijd. [234565:6] [234565:7] [234565:8] Windenergie is trouwens een ander goed alternatief. [567898:1] [234898:8]",
-  "status_code": "LLM_SUCCESS"
-}
-"""
-
-prompt_summarize_question = """
-You are summarizing questions for a pension fund chat bot.
-Summarize the user query in Dutch using MINIMUM 2 words and MAXIMUM 4 WORDS.
-Only return the keywords in a sentence, and do not use commas!
-Re-read your answer to see if it's really maximum 4 words.
-
-Output your summary in the following JSON format:
-
-{
-"summary": "<your summary>"
-}
-
-Always put your summary question in a JSON object. Only output the JSON object, nothing else.
-
-Example Output:
-
-{
-  "summary": "Fiscale ruimte"
-}
-"""
+    prompt = build_prompt(PROJECT_INPUT, row_nodes, QUESTION)
+    response = get_chat_model().invoke(prompt)
+    print(response.content)
 
 
-async def summarize_question(query: str) -> str:
-    """Summarizes a question in a few words."""
-    logger.info(f"Starting summarization for query: {query}")
-
-    messages = [{"role": "system", "message_content": prompt_summarize_question}]
-    messages.extend([{"role": "user", "message_content": query}])
-    messages_lc = convert_to_langchain_messages(messages=messages)
-
-    try:
-        response = await chat_model.ainvoke(messages_lc)
-        logger.info("Received response from chat model for summarization.")
-        summary = validate_summarize_response(response.content)
-        logger.info(f"Extracted summary: {summary}")
-    except Exception as e:
-        logger.error(f"Error during summarization: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    return summary
-
-    
-
-async def rewrite_question(query: str, chat_history: list[dict[str, str]]) -> str:
-    """Rewrites a question based on chat history."""
-    logger.info(f"Starting rewrite for query: {query} with chat history length: {len(chat_history)}")
-
-    context_and_question = f"Context of the chat that you can use to rewrite the question to a standalone question: \n\n{json.dumps(chat_history)}\n\nQuestion to rewrite:\n{query}"
-    messages = [{"role": "system", "message_content": prompt_rewrite_question}]
-    messages.extend([{"role": "user", "message_content": context_and_question}])
-    messages_lc = convert_to_langchain_messages(messages=messages)
-
-    try:
-        response = await chat_model.ainvoke(messages_lc)
-        logger.info("Received response from chat model for rewrite.")
-        logger.info(f"Input for validation: {response.content}\ntype: {type(response.content)}")
-        rewritten_question = validate_rewrite_response(response.content)
-        logger.info(f"Rewritten question: {rewritten_question}")
-    except Exception as e:
-        logger.error(f"Error during question rewrite: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return rewritten_question
-
-
-
-def convert_to_langchain_messages(messages: list[dict[str, str]]):
-    """Helper function that converts messages into langchain messages."""
-    converted = []
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("message_content") or msg.get("content") or msg.get("message")
-        if role == "system":
-            converted.append(SystemMessage(content=content))
-        elif role == "user":
-            converted.append(HumanMessage(content=content))
-        elif role == "assistant":
-            converted.append(AIMessage(content=content))
-    return converted
-
-
-
-async def retrieve_answer_for_user_question(query: str, chat_history: list[dict], fonds: str):
-    """Retrieves an answer for the user question by making use of the RAG methodology."""
-    logger.info(f"Retrieving answer for query: {query} with fonds: {fonds}")
-
-    if chat_history:
-        logger.info("Chat history detected, attempting to rewrite question.")
-        query_rewritten = await rewrite_question(query=query, chat_history=chat_history)
-        logger.info(f"Rewritten query: {query_rewritten}")
-        query = query_rewritten
-
-    try:
-        filter_str = f"category == '{fonds}'"
-        sourcechunks = vector_db.search_with_query_string(query=query,
-                                                          # filter_str=filter_str
-                                                            )
-        logger.info(f"Found {len(sourcechunks[0])} source chunks.")
-        if len(sourcechunks[0]) == 0:
-            raise HTTPException(status_code=404, detail=f"No content for fonds {fonds}")
-    except Exception as e:
-        logger.error(f"Error during vector DB search: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # create subchunks using sentence-based chunking to avoid overlap issues
-    subchunks = []
-    for sourcechunk in sourcechunks[0]:
-        # Use sentence-based chunking to eliminate overlap problems
-        subchunks.extend(chunk_text_by_sentences(text=sourcechunk["text"],
-                                                sourcechunk_id=str(sourcechunk["id"]),
-                                                sourcechunk_url=sourcechunk["entity"].get("source_page", "")
-                                                )
-                         )
-
-    # create context (json string with relevant keys)
-    context = create_context_from_subchunks(subchunks=subchunks)
-
-    # create messages
-    chat_history_lc = convert_to_langchain_messages(chat_history)
-    system_message = SystemMessage(content=prompt_retrieve_answer)
-    user_message = HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}")
-    messages = [system_message] + chat_history_lc + [user_message]
-
-    # use language model
-    try:
-        response = await chat_model.ainvoke(messages)
-        logger.info("Received response from chat model for answer retrieval.")
-        logger.info(f"Input for validation in retrieve_answer_for_user_question: {response.content}\ntype: {type(response.content)}")
-        answer_with_references, status_code = validate_retrieve_answer_response(response.content)
-
-    except Exception as e:
-        logger.error(f"Error parsing final answer: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if status_code == "LLM_NO_ANSWER":
-        return "0x"
-
-    # Process the answer and return it for existing footnote handling
-    # Note: The existing footnote logic in routes.py will handle the superscript conversion
-    sourcechunks_output = []
-    for sourcechunk in sourcechunks[0]:
-        sourcechunk_output = {
-            "sourcechunk_id": str(sourcechunk["id"]),
-            "sourcechunk_content": sourcechunk["text"],
-            "sourcechunk_url": sourcechunk["entity"]["source_page"],
-            "sourcechunk_category": sourcechunk["entity"]["category"],
-            "sourcechunk_kennisbank": sourcechunk["entity"]["kennisbank"]
-        }
-        sourcechunks_output.append(sourcechunk_output)
-
-    # Debug logging to verify ID consistency
-    logger.info(f"LLM_UTILS DEBUG - sourcechunk IDs in subchunks: {set(s.get('sourcechunk_id') for s in subchunks)}")
-    logger.info(f"LLM_UTILS DEBUG - sourcechunk IDs in output: {set(s.get('sourcechunk_id') for s in sourcechunks_output)}")
-
-    return answer_with_references, sourcechunks_output, subchunks
-
-
-def match_subchunks_and_add_footnote_numbers(answer: str, subchunks: list[dict]):
-    """
-    Finds subchunk metadata and adds footnote numbers to bracketed content.
-    Also validates that all footnote references exist in available subchunks.
-    """
-    import re
-    
-    # First, validate footnote references and clean up invalid ones
-    validated_answer, warnings = validate_footnote_references(answer, subchunks)
-    
-    # Log any warnings about invalid footnotes
-    for warning in warnings:
-        logger.warning(warning)
-    
-    subchunk_matches = {}
-
-    # Find all bracketed contents in the validated answer
-    matches = re.findall(r"\[(.*?)\]", validated_answer)
-
-    for i, match in enumerate(matches, start=1):
-        # Replace each bracketed content with numbered footnote format
-        footnote_marker = f"[{match}:{i}]"
-        validated_answer = validated_answer.replace(f"[{match}]", footnote_marker, 1)  # Replace only first occurrence
-        
-        # Link the match with the subchunk metadata using the footnote number as key
-        try:
-            parts = match.split(":")
-            if len(parts) >= 2:
-                sourcechunk_id = parts[0]
-                subchunk_id = parts[1]
-                
-                # Find matching subchunk
-                found_match = False
-                for subchunk in subchunks:
-                    if (str(sourcechunk_id) == str(subchunk.get("sourcechunk_id")) and 
-                        str(subchunk_id) == str(subchunk.get("subchunk_id"))):
-                        # Use the footnote number (i) as the key, not an arbitrary index
-                        subchunk_matches[i] = subchunk
-                        found_match = True
-                        break
-                
-                # Log if we couldn't find a match (this should be rare after validation)
-                if not found_match:
-                    logger.warning(f"Footnote reference [{match}] passed validation but couldn't find matching subchunk")
-                    
-        except (ValueError, IndexError):
-            # If parsing fails, skip this match
-            logger.warning(f"Failed to parse footnote reference: [{match}]")
-            continue
-
-    logger.info(f"Processed {len(matches)} footnote references, {len(subchunk_matches)} successfully linked to subchunks")
-    logger.info(f"SUBCHUNK MATCHES KEYS: {list(subchunk_matches.keys())}")
-    if warnings:
-        logger.info(f"Removed {len(warnings)} invalid footnote references")
-
-    # Convert subchunk matches to use display_text to avoid overlaps in UI
-    display_subchunk_matches = get_display_text_for_subchunk_matches(subchunk_matches)
-
-    return validated_answer, display_subchunk_matches
+if __name__ == "__main__":
+    main()
