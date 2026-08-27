@@ -1,984 +1,323 @@
-import logging
-from datetime import datetime, timedelta
-from typing import List, Tuple, Dict, Any
-from azure.cosmos import ContainerProxy
-
-from src.calculate_metrics import (
-    general_information,
-    user_aggregation,
-    document_info,
-    document_info_per_user,
-    subject_info_per_user,
-    cache_metrics,
-    cache_info,
-)
-
-
-def query_cosmosdb(
-    container: ContainerProxy, period: int, model: str, logger: logging.Logger
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Query Cosmos DB for answers and feedbacks within a specified time period,
-    filtered by a specific model.
-
-    Args:
-        container (ContainerProxy): The Cosmos DB container to query.
-        period (int): The number of days to look back from the current date.
-        model (str): The model type to filter answers and feedbacks by (e.g., "gpt-4o").
-        logger (Logger): A logging object to record informational messages.
-
-    Returns:
-        tuple: A tuple containing two lists:
-            - answers_per_model (list): List of answers associated with the specified model.
-            - feedbacks_per_model (list): List of feedbacks associated with the specified model.
-
-    """
-    if model not in ["gpt-4o", "cache"]:
-        logger.info(
-            f"Invalid model '{model}' for query search. Please use 'gpt-4o' or 'cache'."
-        )
-        return [], []
-
-    current_datetime = datetime.now()
-    begin_ts = (current_datetime - timedelta(days=period)).timestamp()
-    answerquery = f"SELECT * FROM c WHERE c._ts >= {begin_ts} AND (c.type = @type1 OR c.type= @type2)"
-    feedbackquery = f"SELECT * FROM c WHERE c._ts >= {begin_ts} AND c.type = @type"
-
-    # answers
-    answer_items = container.query_items(
-        query=answerquery,
-        parameters=[
-            {"name": "@type1", "value": "NEW_ANSWER"},
-            {"name": "@type2", "value": "GENERATE_WITHOUT_CACHE"},
-        ],
-        enable_cross_partition_query=True,
-    )
-
-    answers = [
-        answer
-        for answer in answer_items
-        if model in answer.get("modelMetaData", {}).get("modelType", "")
-    ]
-
-    # feedbacks
-    if model == "cache":
-        feedback_items = container.query_items(
-            query=feedbackquery,
-            parameters=[{"name": "@type", "value": "NEW_FEEDBACK_CACHED"}],
-            enable_cross_partition_query=True,
-        )
-        feedback_reasons = container.query_items(
-            query=feedbackquery,
-            parameters=[{"name": "@type", "value": "NEW_FEEDBACK_CACHED_REASON"}],
-            enable_cross_partition_query=True,
-        )
-
-    else:
-        feedback_items = container.query_items(
-            query=feedbackquery,
-            parameters=[{"name": "@type", "value": "NEW_FEEDBACK"}],
-            enable_cross_partition_query=True,
-        )
-        feedback_reasons = []
-
-    feedbacks = [
-        feedback
-        for feedback in feedback_items
-        if model
-        in feedback.get("history", [{}])[-1]
-        .get("modelMetaData", {})
-        .get("modelType", "")
-    ]
-
-    feedback_reasons = [reason for reason in feedback_reasons]
-
-    return answers, feedbacks, feedback_reasons
-
-
-def get_data(
-    container: ContainerProxy,
-    timedelta_days: int,
-    model: str,
-    mappings: Dict[str, Any],
-    logger: logging.Logger,
-) -> Dict[str, Dict[str, Any]]:
-    """
-    Retrieves and processes data from a database, aggregating various metrics based on the given parameters.
-
-    Args:
-        container: The database container from which data is queried.
-        timedelta_days: The number of days to look back when querying the data.
-        model: The model type to filter the data by. Options are 'both', 'gpt4', or 'gpt3'.
-        mappings: A dictionary of mappings to be used in processing the data.
-        logger: The logger object to log warnings and information.
-
-    Returns:
-        Dict[str, Dict[str, Any]]: A dictionary containing the aggregated data, organized into various categories.
-    """
-    logger.info("[INIT] Querying Cosmosdb...")
-    result = {}
-    answers, feedbacks, _ = query_cosmosdb(container, timedelta_days, model, logger)
-    cache_answers, cache_feedbacks, cache_feedback_reasons = query_cosmosdb(
-        container, timedelta_days, "cache", logger
-    )
-    logger.info("[DONE] Querying Cosmosdb...")
-
-    if len(answers) == 0:
-        logger.warning(
-            "[ERROR] No answers found in this period. Cannot calculate metrics!"
-        )
-        return None
-    else:
-        logger.info("[INIT] Calculating metrics...")
-        result["general_info"] = general_information(
-            answers, feedbacks, cache_answers, cache_feedbacks, cache_feedback_reasons
-        )
-        result["cache_metrics"] = cache_metrics(cache_feedbacks)
-        result["cache_info"] = cache_info(cache_feedbacks, cache_feedback_reasons)
-
-        result["per_user_info"] = user_aggregation(answers, feedbacks)
-        result["document_info"] = document_info(
-            answers,
-            feedbacks,
-            mappings,
-            level="doc",
-        )
-
-        result["document_info_per_user"] = document_info_per_user(answers, mappings)
-
-        result["subject_info"] = document_info(
-            answers,
-            feedbacks,
-            mappings,
-            level="subject",
-        )
-        result["subject_info_per_user"] = subject_info_per_user(answers, mappings)
-        logger.info("[DONE] Calculating metrics...")
-
-    return result
-
-fucntion app:
-import logging
 import os
-import requests
+from langchain_openai.chat_models import AzureChatOpenAI
+from application.vectordatabase.utils.util_functions import load_config, get_auth_token
+config = load_config(os.environ['CONFIG'])
+
+def get_chat_model():
+    """ Returns OpenAI chat model """
+    return  AzureChatOpenAI(
+        azure_endpoint=config['openai']['chat_model']['endpoint'],
+        azure_deployment=config['openai']['chat_model']['deployment_id'],
+        azure_ad_token_provider= lambda: get_auth_token(config),  
+        api_version=config['openai']['chat_model']['api_version'],
+        openai_api_type=config['openai']['chat_model']['api_type'],
+        temperature=0
+        )
+
+
+
+utils:
+import os
+
+from application.models.chat_model import get_chat_model
+from application.vectordatabase.src.database.vector_database import Vectordatabase
+from application.vectordatabase.utils.util_functions import load_config
+
+from langchain.schema import HumanMessage, AIMessage, SystemMessage
+from fastapi import HTTPException
 import json
-import openai
+import logging
 import re
-import time
-
-import azure.functions as func
-from azure.cosmos import CosmosClient, PartitionKey
-
-from langchain.chat_models.azureml_endpoint import (
-    AzureMLChatOnlineEndpoint,
-    LlamaContentFormatter,
+from backend.llm_validation import (
+    validate_summarize_response,
+    validate_rewrite_response, 
+    validate_retrieve_answer_response,
+    create_context_from_subchunks,
+    chunk_text_with_overlap_and_positions,
+    chunk_text_by_sentences,
+    validate_footnote_references,
+    get_display_text_for_subchunk_matches
 )
 
-from typing import List, Optional, Any
-from pydantic import BaseModel, field_validator, ValidationError, ConfigDict
+logging.basicConfig(
+    filename='app.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
-
-
-# Azure OpenAi API response object schema
-class Citation(BaseModel):
-    content: Optional[Any]
-    id: Optional[Any] = ""
-    title: Optional[Any] = ""
-    filepath: Optional[Any] = ""
-    url: Optional[Any] = ""
-    metadata: Optional[Any] = ""
-    page_numbers: Optional[Any] = ""
-    chunk_id: Optional[Any] = ""
-
-    @field_validator("metadata", mode="before")
-    def validate_metadata(cls, v):
-        if isinstance(v, dict):
-            return str(dict(v))
-        return v
+logger = logging.getLogger(__name__)
 
 
-class Context(BaseModel):
-    intent: Optional[Any] = ""
-    search_intent: Optional[Any] = ""
-    citations: Optional[List[Citation]]
+config = load_config(os.environ['CONFIG'])
 
+chat_model = get_chat_model()
 
-class AssistantMessage(BaseModel):
-    role: str
-    content: str
-    function_call: Optional[Any]
-    tool_calls: Optional[Any]
-    end_turn: Optional[bool] = None
-    context: Optional[Context] = None
+#Initialiseer vectordatabase
+path = config['sharepoint']['db_path']
+#path = vervang met path waar je de database zet
+vector_db = Vectordatabase(db_path=path, collection_name="Kennisbank")
 
+prompt_rewrite_question = """
+Rewrite the MOST RECENT QUESTION into a STANDALONE QUESTION in its original language (Dutch) using the rest of the chat as CONTEXT.
 
-class Choice(BaseModel):
-    index: int
-    finish_reason: str
-    message: AssistantMessage
-
-
-class Usage(BaseModel):
-    completion_tokens: int
-    prompt_tokens: int
-    total_tokens: int
-
-
-class OpenAIResponse(BaseModel):
-    id: Optional[str]
-    model: str
-    created: int
-    object: str
-    system_finger_print: Optional[Any] = None
-    usage: Optional[Usage] = None
-    choices: List[Choice]
-
-
-# This API return object schema
-class Reference(BaseModel):
-    id: Optional[str] = ""
-    content: str = ""
-    title: Optional[str] = ""
-    filepath: str = ""
-    url: Optional[str] = ""
-
-
-class ModelInfo(BaseModel):
-    prompt_version: str
-    model_version: str
-    model_type: str
-    model_config = ConfigDict(protected_namespaces=())
-
-
-class UsageInfo(BaseModel):
-    completion_tokens: int
-    prompt_tokens: int
-    total_tokens: int
-    completion_time: int
-
-
-class ChatResponse(BaseModel):
-    answer: str
-    question: str
-    chat_history: list = []
-    source_documents: List[Reference]
-    model_info: ModelInfo
-    model_usage: UsageInfo
-
-
-def format_response(
-    response: OpenAIResponse,
-    completion_time: int,
-    prompt: str,
-    history: list,
-    prompt_version: str,
-    model_version: str,
-    model_type: str,
-    cls=ChatResponse,
-):
-    tmp = {
-        "answer": reformat_citations(response.choices[0].message.content),
-        "question": prompt,
-        "chat_history": history,
-    }
-
-    refs = []
-    if response.choices[0].message.context:
-        for idx, citation in enumerate(response.choices[0].message.context.citations):
-            refs.append(
-                {
-                    "id": str(idx + 1),
-                    "title": citation.title,
-                    "filepath": (
-                        "" if citation.filepath is None else citation.filepath
-                    ),
-                    "url": citation.url,
-                    "content": citation.content.encode("utf-8"),
-                }
-            )
-    tmp["source_documents"] = refs
-    tmp["model_info"] = {
-        "prompt_version": prompt_version if prompt_version is not None else "missing",
-        "model_version": model_version if model_version is not None else "missing",
-        "model_type": model_type if model_type is not None else "missing",
-    }
-    tmp["model_usage"] = {
-        "completion_tokens": response.usage.completion_tokens,
-        "prompt_tokens": response.usage.prompt_tokens,
-        "total_tokens": response.usage.completion_tokens + response.usage.prompt_tokens,
-        "completion_time": completion_time,
-    }
-    return cls.model_validate(tmp)
-
-
-context_gpt4 = """You are a Dutch-speaking AI assistant for a pension fund.
-Provide answers exclusively from provided documents, adhering to specific terminology.
-Utilize chat history to refine the question.
-If a query is unclear, ask for context.
-Use bullet lists wherever possible and always respond in Dutch.
-It's December 2023; you take a step-by-step approach in your response,
-cite sources, give reasoning and include details (
-like timelines, processes, entities, amounts, requirements and exceptions) before sharing final answer.
-"""
-
-context_gpt3 = """You are a Dutch-speaking AI for a pension fund.
-Provide answers exclusively from provided documents, adhering to specific terminology.
-If a query is unclear, ask for context.
-Utilize chat history to refine the question.
-It's November 2023; cite retrieved documents, reason step-by-step, and give all details
-(such as timelines, processes, entities, amounts, requirements, required documents, and exceptions).
-Always respond in Dutch.
-"""
-
-
-context_llama2 = """Give answer to the QUESTION:
-- Only use information from documents in CONTEXT. If none are helpful, indicate that.
-- Answer and rephrase in Dutch language.
-- Every sentence includes a reference to the document number you used from CONTEXT.
-- Answer in Dutch language only!"""
-
-context_samenvatting = """You are summarizing questions for a pension fund chat bot. 
-Summarize the sentence in Dutch using MAXIMUM 2 WORDS, identifying key words regarding pension. 
-Only return the keywords in a sentence. and do not use commas!
-Re-read your answer to see if it's really maximum 2 words.
-
-####Examples####
-Sentence: Wat is fiscale ruimte?
-Summary: Fiscale ruimte
-Sentence: Welke impact heeft scheiden op mijn lopende nabestaandenpensioen?
-Summary: Scheiden nabestaandenpensioen
-Sentence: wat is indexatie en wat voor impact heeft dit op mijn pensioen?"
-Summary: Indexatie
-####
-
-Sentence & your summary in maximum 2 words:
-"""
-
-abbreviations = {
-    "AAOP": "ABP Arbeidsongeschiktheidspensioen",
-    "ADV": "Attestatie de Vita",
-    "AEP": "ABP Extra Pensioen",
-    "AFUP": "extra voorwaardelijk pensioen (VPL) voor Politie",
-    "AKP": "ABP KeuzePensioen",
-    "ANW": "Algemene nabestaandenwet",
-    "AO": "Arbeidsongeschiktheidspensioen",
-    "AOIV": "Aanvullende Arbeidsongeschiktheids- en Invaliditeitsvoorzieningen militairen",
-    "AOM": "Arbeidsongeschiktheidspensioen militairen",
-    "AOW": "Algemene ouderdomswet",
-    "AVG": "Algemene Verordening Gegevensbescherming",
-    "BGS": "burgerlijke staat",
-    "BIV": "Bijzondere Invaliditeitsverhoging",
-    "BMN": "Bijzonder Militair Nabestaandenpensioen",
-    "BMNP": "Bijzonder Militair Nabestaandenpensioen",
-    "BMP": "Bijzondere Militaire Pensioenen",
-    "BNP": "Bijzonder Nabestaandenpensioen",
-    "(B)NP": "(Bijzonder) Nabestaandenpensioen",
-    "BRE": "nieuwe pension administratiesysteem",
-    "BRD": "Bijzonder Regelingen Defensie",
-    "BSN": "Burgerservicenummer",
-    "BWW": "Bovenwettelijke uitkering voor werkloosheid",
-    "CAO": "Collectieve arbeidsovereenkomst",
-    "CWB": "Contante Waardeberekening",
-    "DEF": "beroepsmilitair",
-    "DN": "Deelnemer",
-    "DOBZ": "dienstongeval of een beroepsziekte",
-    "DTO": "Diensttijdoverzicht",
-    "EDM": "Persoonlijke e-mail",
-    "EUPO": "Uniform Pensioen Overzicht voor Ex-partners",
-    "FLO": "functioneel leeftijdsontslag",
-    "FPU": "Flexibel Pensioen en Uittreden",
-    "GBA": "Gemeentelijke Basisadministratie",
-    "HPT": "herplaatsingstoelage",
-    "INK": "Inkomensvoorziening in verband met zorg",
-    "IOW": "Wet inkomensvoorziening oudere werklozen",
-    "IP": "Invaliditeitspensioen",
-    "IPP": "Invaliditeitspensioen dienstplicht en beroepsmilitair",
-    "IVA": "Inkomensvoorziening Volledig Arbeidsongeschikten",
-    "LAU 1": "Loonaanvullingsuitkering 1",
-    "LAU 2": "Loonaanvullingsuitkering 2",
-    "LGU": "Loongerelateerde uitkering",
-    "MIP": "Militair Invaliditeitspensioen",
-    "MNP": "Militair NabestaandenPensioen",
-    "MOD": "Militaire Oorlogs- en Dienstslachtoffers",
-    "MVV": "Medische Voorzieningen en Verstrekkingen regeling",
-    "nDER": "nieuwe Diensteinderegeling",
-    "NP": "Nabestaandenpensioen",
-    "OCC": "Online Contact Center",
-    "oDER": "oude Diensteinderegeling",
-    "OP": "Ouderdomspensioen",
-    "OTR": "Opbouw Tussen Resultaat",
-    "O&O": "bovenwettelijke uitkering voor overheids- en onderwijspersoneel",
-    "PAS": "Partiële Arbeidsparticipatie Senioren",
-    "PR": "Pensioenreglement",
-    "PTSS": "Posttraumatische stressstoornis",
-    "PVB": "Premievrije pensioenopbouw",
-    "RVC": "restverdiencapaciteit",
-    "RNI": "Instituut Registratie Niet-Ingezetenen",
-    "RVU": "regelingen voor vervroegde uittreding",
-    "SDT": "Samenvallende Diensttijd",
-    "SLC": "samenlevingscontract",
-    "SMO": "Sociaal Medisch Onderzoek",
-    "SVB": "Sociale Verzekeringsbank",
-    "SZW": "Sociale Zaken en Werkgelegenheid",
-    "TWK": "Terugwerkende kracht",
-    "UPO": "Uniform Pensioenoverzicht",
-    "UGM": "Uitkering Gewezen Militairen",
-    "UWV": "Uitvoeringsinstituut Werknemersverzekeringen",
-    "VPL": "Voorwaardelijk pensioen VUT, prepensioen en levensloop",
-    "VPS": "Wet Verevening Pensioenrechten bij Scheiding",
-    "VTA": "AOW-hiaat",
-    "VUPO": "Vertrekkers Uniform Pensioenoverzicht",
-    "VVU": "Vervolguitkering",
-    "WAO": "Wet arbeidsongeschiktheidsverzekering",
-    "WG": "Werkgever",
-    "WGA": "Werkhervatting Gedeeltelijk Arbeidsgeschikten",
-    "WIA": "Wet werk en Inkomen naar Arbeidsvermogen",
-    "Wlz": "Wet langdurige zorg",
-    "WTP": "Wet toekomst pensioenen",
-    "WW": "Werkloosheidswet",
-    "Zvw": "Zorgverzekeringswet",
+You put the answer in markdown within a JSON object with the following format:
+{
+  "standalone_question": "<your written stand alone question>"
 }
 
+Always put your standalone question in a JSON object. Only output the JSON object, nothing else.
 
-def replace_abbreviations(text: str, abbreviations: dict = abbreviations) -> str:
-    sorted_abbreviations = sorted(abbreviations.keys(), key=len, reverse=True)
+### Example Output:
+```json
+{
+  "standalone_question": "Wat is de hoofdstad van Frankrijk?"
+}
 
-    for abbreviation in sorted_abbreviations:
-        full_form = abbreviations[abbreviation]
-        pattern = re.compile(rf"\b{re.escape(abbreviation)}\b")
-        text = pattern.sub(f"{full_form} ({abbreviation})", text)
-
-    return text
-
-
-def reformat_citations(input_string):
-    pattern = r"\[doc(\d+)\]"
-
-    def replace_citation(match):
-        citation_number = int(match.group(1))
-        return f"[{citation_number}]"
-
-    formatted_string = re.sub(pattern, replace_citation, input_string)
-    citation_numbers = set(
-        int(match.group(1)) for match in re.finditer(pattern, input_string)
-    )
-    if len(citation_numbers) > 1:
-        formatted_string = re.sub(
-            r"\[([\d,]+)\]",
-            lambda match: f'[{",".join(match.group(1).split(","))}]',
-            formatted_string,
-        )
-    return formatted_string
-
-
-def standalone_question(llm: Any, chat_history: str, followup_question: str) -> str:
-    """
-    Given chat history, use a llm to rephrase the user question to a standalone question useable for vector search.
-    Tries to replace 'this' and 'it' etc with their actual meanings as given earlier in the chat history.
-    """
-    if len(chat_history) == 0:
-        return followup_question
-    else:
-        qa = ""
-        for i, (question, answer) in enumerate(chat_history):
-            qa += f"QUESTION {i+1}:\n {question}\n\n"
-            qa += f"ANSWER {i+1}:\n {answer}\n\n"
-        chat_history = qa
-
-    rephrase_template = f"""
-Given the following conversation and follow-up question,
-rephrase the follow-up question to be a standalone question in the original language.
-Convert the question into a query for a vectorstore in the original language,
-and strip out information that is not relevant for the retrieval task.
-Give back only the standalone question.
-----------
-CHAT HISTORY:
-{chat_history}
-----------
-FOLLOWUP QUESTION:
-{followup_question}
-----------
-Standalone question:
 """
-    return llm.invoke(rephrase_template).content
+
+prompt_retrieve_answer = """
+Your task is to provide an answer to the user query. In answering the user's query, use exclusively the content from the provided CONTEXT or the conversation history, adhering to specific terminology.
+The CONTEXT is in a json object that contains documents, and each document is split into subchunks. Each subchunk has a document_id and a subchunk_id.
+If you cannot find an answer from the provided CONTEXT or the CONVERSATION HISTORY, your answer be an empty string.
+
+You put the answer in markdown within a JSON object with the following format:
+{
+"answer": "<your answer here in markdown>",
+"status_code": "<your status code>"
+}
+
+where the status code is one of the following:
+    If you cannot find an answer from using the provided CONTEXT or the CONVERSATION HISTORY, provide the following status code: "LLM_NO_ANSWER"
+    If you are able to provide an answer without asking for extra context, provide the following status code: "LLM_SUCCESS".
+
+Extra instructions for your answer:
+    For every factual claim or statement you make, you must include an inline citation immediately after the claim from the CONTEXT. Use the format [document_id:subchunk_id]. If you need multiple subchunks to support a claim, use multiple inline citations (eg. [document_1:subchunk_1] [document_1:subchunk_2]). Do not group citations at the end of the answer. Instead distribute them throughout the reponse so that each claim is clearly backed by a subchunk.
+    Use bullet lists wherever possible and always answer in Dutch.
+    You take a step-by-step approach in your answer, give reasoning and include details (like timelines, processes, entities, amounts, requirements and exceptions).
+
+Always put your answer (in markdown format) and the status code in a JSON object. Only output the JSON object, nothing else.
+
+Example Output:
+
+{
+  "answer": "Zonnenpanelen zijn het meest efficient wanneer ze naar het zuiden zijn gericht. [234564:12] Ze gaan ook slechter werken na verloop van tijd. [234565:6] [234565:7] [234565:8] Windenergie is trouwens een ander goed alternatief. [567898:1] [234898:8]",
+  "status_code": "LLM_SUCCESS"
+}
+"""
+
+prompt_summarize_question = """
+You are summarizing questions for a pension fund chat bot.
+Summarize the user query in Dutch using MINIMUM 2 words and MAXIMUM 4 WORDS.
+Only return the keywords in a sentence, and do not use commas!
+Re-read your answer to see if it's really maximum 4 words.
+
+Output your summary in the following JSON format:
+
+{
+"summary": "<your summary>"
+}
+
+Always put your summary question in a JSON object. Only output the JSON object, nothing else.
+
+Example Output:
+
+{
+  "summary": "Fiscale ruimte"
+}
+"""
 
 
-@app.route(route="message")
-def message(req: func.HttpRequest, context: func.Context) -> func.HttpResponse:
-    logging.info("Python conversation function started processing a request.")
-    started = time.time()
-    try:
-        req_body = req.get_json()
-    except ValueError:
-        return func.HttpResponse("Empty body", status_code=400)
+async def summarize_question(query: str) -> str:
+    """Summarizes a question in a few words."""
+    logger.info(f"Starting summarization for query: {query}")
 
-    used_model = req_body.get("model", "gpt3")
-
-    search_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")
-    search_key = os.getenv("AZURE_SEARCH_KEY")
-    strictness = 3
-
-    embedding_deployment_id = os.getenv("AZURE_OPENAI_EMBEDDINGS_ID")
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION")
-    api_type = "azure"
-    openai.api_type = api_type
-    openai.api_version = api_version
-
-    if used_model == "gpt3":
-        llm_context = context_gpt3
-        chat_deployment_id = "gpt-35-turbo-1106"
-        chat_base_url = os.getenv("AZURE_OPENAI_ENDPOINT")
-        chat_key = os.getenv("AZURE_OPENAI_KEY")
-        search_index_name = os.getenv("AZURE_SEARCH_INDEX")
-        n_returned_documents = 4
-    elif used_model == "gpt4":
-        llm_context = context_gpt4
-        chat_deployment_id = "gpt-4"
-        chat_base_url = os.getenv("AZURE_OPENAI_ENDPOINT")
-        chat_key = os.getenv("AZURE_OPENAI_KEY")
-        search_index_name = os.getenv("AZURE_SEARCH_INDEX")
-        n_returned_documents = 4
-    elif "llama" in used_model:
-        llm_context = context_llama2
-        LLAMA_ENDPOINT_URL = (
-            "https://aml-knowledge-repo-llama.westeurope.inference.ml.azure.com/score"
-        )
-        LLAMA_API_KEY = ""
-        LLAMA_NAME = "llama-2-70b-chat-13"
-        search_index_name = os.getenv("AZURE_SEARCH_INDEX")
-        n_returned_documents = 4
-    elif "samenvatting" in used_model:
-        llm_context = context_samenvatting
-        chat_deployment_id = "gpt-35-turbo-1106"
-        chat_base_url = os.getenv("AZURE_OPENAI_ENDPOINT")
-        chat_key = os.getenv("AZURE_OPENAI_KEY")
-    else:
-        logging.warning(f"Unknown model type, using default context: {used_model}")
-        return func.HttpResponse(
-            status_code=200,
-            body=json.dumps(
-                {
-                    "answer": f"{used_model} is unknown",
-                    "question": f"{used_model} is unknown",
-                    "chat_history": [],
-                    "source_documents": [],
-                    "model_info": {
-                        "prompt_version": "unknown",
-                        "model_version": "unknown",
-                        "model_type": "unknown",
-                    },
-                    "model_usage": {
-                        "completion_tokens": 0,
-                        "prompt_tokens": 0,
-                        "total_tokens": 0,
-                        "completion_time": 0,
-                    },
-                }
-            ),
-        )
-
-    messages = req_body.get("messages", [])
-    logging.info("messages:")
-    logging.info(messages)
-
-    prompt = req_body.get("prompt", "")
-    logging.info(f"original prompt: {prompt}")
-
-    prompt = replace_abbreviations(prompt)
-    logging.info(f"replaced prompt: {prompt}")
-
-    if "llama" in used_model:
-        embedding = (
-            openai.AzureOpenAI(
-                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-                api_key=os.getenv("AZURE_OPENAI_KEY"),
-                api_version=api_version,
-            )
-            .embeddings.create(
-                input=prompt,
-                model=embedding_deployment_id,
-            )
-            .data[0]
-            .embedding
-        )
-
-        logging.info("LLAMA API embedding:")
-        logging.info(embedding)
-
-        retrievals = requests.post(
-            f"{search_endpoint}/indexes/{search_index_name}/docs/search?api-version=2023-11-01",
-            headers={"Content-Type": "application/json", "api-key": search_key},
-            data=json.dumps(
-                {
-                    "count": True,
-                    "select": "content, url, title, filepath",
-                    "vectorQueries": [
-                        {
-                            "vector": embedding,
-                            "k": n_returned_documents,
-                            "fields": "content_vector",
-                            "kind": "vector",
-                            "exhaustive": True,
-                        }
-                    ],
-                }
-            ),
-        )
-        logging.info("LLAMA API request status:")
-        logging.info(retrievals.status_code)
-        logging.info("LLAMA API retrievals:")
-        logging.info(retrievals.json())
-
-        result = retrievals.json()
-        document_results = []
-        for i, value in enumerate(result["value"]):
-            document_results.append(
-                {
-                    "id": str(i + 1),
-                    "content": value["content"],
-                    "url": value["url"],
-                    "title": value["title"],
-                    "filepath": value["filepath"],
-                }
-            )
-
-        llm = AzureMLChatOnlineEndpoint(
-            endpoint_url=LLAMA_ENDPOINT_URL,
-            endpoint_api_key=LLAMA_API_KEY,
-            deployment_name=LLAMA_NAME,
-            content_formatter=LlamaContentFormatter(),
-            model_kwargs={"max_new_tokens": 512, "temperature": 0.0, "seed": 0},
-        )
-
-        context = "CONTEXT:\n"
-        for doc in document_results:
-            content = doc["content"].strip()
-            content = re.sub(r"\n{3,}", "\n\n", content)
-            context += f"DOC {doc['id']}: {content}\n"
-        question = "\nQUESTION:\n" + standalone_question(llm, messages, prompt)
-
-        prompt_template = (
-            "[INST]<<SYS>>"
-            + llm_context
-            + "<</SYS>>"
-            + "\n"
-            + context
-            + question
-            + "\nYour final answer in Dutch:[/INST]"
-        )
-        logging.info("LLAMA API prompt_template:")
-        logging.info(prompt_template)
-
-        answer = llm.invoke(prompt_template)
-        logging.info("LLAMA API response structure:")
-        logging.info(dir(answer))
-        logging.info("LLAMA API response content:")
-        logging.info(answer.content)
-
-        res = ChatResponse.model_validate(
-            {
-                "answer": answer.content,
-                "question": f"{prompt} |CONVERTED TO| {question}",
-                "chat_history": messages,
-                "source_documents": document_results,
-                "used_model_info": {
-                    "prompt_version": llm_context,
-                    "model_version": LLAMA_NAME,
-                    "model_type": used_model,
-                },
-            }
-        )
-
-        return func.HttpResponse(status_code=200, body=res.model_dump_json())
-
-    elif "samenvatting" in used_model:
-        message = [{"role": "user", "content": llm_context + prompt}]
-        client = openai.AzureOpenAI(
-            base_url=f"{chat_base_url}openai/deployments/{chat_deployment_id}",
-            api_key=chat_key,
-            api_version=api_version,
-        )
-        completion = client.chat.completions.create(
-            model=chat_deployment_id, messages=message, temperature=0, seed=0
-        )
-
-        validated = OpenAIResponse.model_validate(completion.model_dump())
-
-        logging.info("AzureOpenAI API response:")
-        logging.info(validated.model_dump_json())
-
-        response = format_response(
-            response=validated,
-            completion_time=int((time.time() - started) * 1000),
-            prompt=prompt,
-            history=messages,
-            prompt_version=llm_context,
-            model_version=chat_deployment_id,
-            model_type=used_model,
-        )
-
-        logging.info("Final response:")
-        logging.info(response.model_dump_json())
-
-        return func.HttpResponse(status_code=200, body=response.model_dump_json())
-
-    else:
-        step2 = []
-        for question, answer in messages:
-            step2.append({"role": "user", "content": question})
-            step2.append({"role": "assistant", "content": answer})
-
-        step3 = [{"role": "user", "content": prompt}]
-
-        client = openai.AzureOpenAI(
-            base_url=f"{chat_base_url}openai/deployments/{chat_deployment_id}",
-            api_key=chat_key,
-            api_version=api_version,
-        )
-
-        completion = client.chat.completions.create(
-            model=chat_deployment_id,
-            messages=step2 + step3,
-            temperature=0,
-            seed=0,
-            extra_body={
-                "data_sources": [
-                    {
-                        "type": "azure_search",
-                        "parameters": {
-                            "index_name": search_index_name,
-                            "endpoint": search_endpoint,
-                            "key": search_key,
-                            "query_type": "vector",
-                            "fields_mapping": {
-                                "vector_fields": ["content_vector"],
-                                "url_field": "url",
-                                "title_field": "title",
-                                "filepath_field": "filepath",
-                                "content_fields": ["content"],
-                            },
-                            "in_scope": True,
-                            "top_n_documents": n_returned_documents,
-                            "role_information": llm_context,
-                            "embedding_dependency": {
-                                "type": "deployment_name",
-                                "deployment_name": embedding_deployment_id,
-                            },
-                            "strictness": strictness,
-                        },
-                    }
-                ]
-            },
-        )
-
-        validated = OpenAIResponse.model_validate(completion.model_dump())
-
-        logging.info("AzureOpenAI API response:")
-        logging.info(validated.model_dump_json())
-
-        response = format_response(
-            response=validated,
-            completion_time=int((time.time() - started) * 1000),
-            prompt=prompt,
-            history=messages,
-            prompt_version=llm_context,
-            model_version=chat_deployment_id,
-            model_type=used_model,
-        )
-
-        logging.info("Final response:")
-        logging.info(response.model_dump_json())
-
-        return func.HttpResponse(status_code=200, body=response.model_dump_json())
-
-
-class CosmosDBHandler:
-    def __init__(self):
-        connection_str = os.environ["CosmosDBConnectionString"]
-        db_name = os.environ["CosmosDBDatabaseName"]
-        self.client = CosmosClient.from_connection_string(connection_str)
-        self.database = self.client.create_database_if_not_exists(id=db_name)
-        self.answer_container = self.database.create_container_if_not_exists(
-            id="answers", partition_key=PartitionKey(path="/sessionId")
-        )
-        self.question_container = self.database.create_container_if_not_exists(
-            id="questions", partition_key=PartitionKey(path="/sessionId")
-        )
-
-    def add_answer(self, answer):
-        try:
-            answer_data = answer.model_dump()
-            self.answer_container.create_item(body=answer_data)
-        except ValidationError as e:
-            print(f"Data validation error: {e}")
-
-    def get_answer(self, answer_id: str):
-        try:
-            answer_data = self.answer_container.read_item(
-                item=answer_id, partition_key=answer_id
-            )
-            return answer_data
-        except ValidationError as e:
-            print(f"Data validation error: {e}")
-            return None
-
-    def add_question(self, question):
-        try:
-            question_data = question.model_dump()
-            self.question_container.create_item(body=question_data)
-        except ValidationError as e:
-            print(f"Data validation error: {e}")
-
-    def get_question(self, question_id: str):
-        try:
-            question_data = self.question_container.read_item(
-                item=question_id, partition_key=question_id
-            )
-            return question_data
-        except ValidationError as e:
-            logging.error(f"Data validation error: {e}")
-            return None
-
-
-def get_chat_session(sessionId: str, db: CosmosDBHandler) -> list:
-    # Get questions
-    query = (
-        "SELECT * FROM questions q WHERE q.sessionId = @sessionId ORDER BY q._ts ASC"
-    )
-    params = [dict(name="@sessionId", value=sessionId)]
-    results = db.answer_container.query_items(
-        query=query, parameters=params, enable_cross_partition_query=False
-    )
-    questions = [x for x in results]
-
-    # Get answers
-    query = "SELECT * FROM answers a WHERE a.sessionId = @sessionId ORDER BY a._ts ASC"
-    params = [dict(name="@sessionId", value=sessionId)]
-    results = db.answer_container.query_items(
-        query=query, parameters=params, enable_cross_partition_query=False
-    )
-    answers = [x for x in results]
-
-    # Yes, this is O(n^2) complexity. No, it shouldn't be a problem unless we hit really large sessions
-    sessionlist = []
-    for question in questions:
-        for answer in answers:
-            if question["id"] == answer["id"]:
-                sessionlist.append((question, answer))
-
-    # Sort by timestamp
-    sessionlist = sorted(sessionlist, key=lambda x: x["_ts"])
-
-    return sessionlist
-
-
-@app.route(route="CosmosDBLogWrite")
-@app.cosmos_db_output(
-    arg_name="outputDocument",
-    database_name="openailogs",
-    container_name="Logs",
-    connection="CosmosDbConnectionString",
-)
-def CosmosDBLogWrite(
-    req: func.HttpRequest,
-    outputDocument: func.Out[func.Document],
-    context: func.Context,
-) -> func.HttpResponse:
-    logging.info("Python CosmosDBLogWrite started processing a request.")
+    messages = [{"role": "system", "message_content": prompt_summarize_question}]
+    messages.extend([{"role": "user", "message_content": query}])
+    messages_lc = convert_to_langchain_messages(messages=messages)
 
     try:
-        req_body = req.get_json()
-    except ValueError:
-        pass
+        response = await chat_model.ainvoke(messages_lc)
+        logger.info("Received response from chat model for summarization.")
+        summary = validate_summarize_response(response.content)
+        logger.info(f"Extracted summary: {summary}")
+    except Exception as e:
+        logger.error(f"Error during summarization: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    return summary
 
-    if "id" not in req_body.keys():
-        logging.info("using default id")
-        req_body["id"] = str(context.invocation_id)
+    
 
-    outputDocument.set(func.Document.from_dict(req_body))
-    logging.info(f"processed request with id {id}")
-    return func.HttpResponse(f"Processed request with id {id}", status_code=200)
-response.py:
-import ast
-from constants.pydantic_classes import OpenAIResponse, ChatResponse
-from helper_functions.reformatting import reformat_citations
-from typing import Optional
+async def rewrite_question(query: str, chat_history: list[dict[str, str]]) -> str:
+    """Rewrites a question based on chat history."""
+    logger.info(f"Starting rewrite for query: {query} with chat history length: {len(chat_history)}")
+
+    context_and_question = f"Context of the chat that you can use to rewrite the question to a standalone question: \n\n{json.dumps(chat_history)}\n\nQuestion to rewrite:\n{query}"
+    messages = [{"role": "system", "message_content": prompt_rewrite_question}]
+    messages.extend([{"role": "user", "message_content": context_and_question}])
+    messages_lc = convert_to_langchain_messages(messages=messages)
+
+    try:
+        response = await chat_model.ainvoke(messages_lc)
+        logger.info("Received response from chat model for rewrite.")
+        logger.info(f"Input for validation: {response.content}\ntype: {type(response.content)}")
+        rewritten_question = validate_rewrite_response(response.content)
+        logger.info(f"Rewritten question: {rewritten_question}")
+    except Exception as e:
+        logger.error(f"Error during question rewrite: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return rewritten_question
 
 
-def format_response(
-    response: OpenAIResponse,
-    completion_time: int,
-    prompt: str,
-    history: list,
-    prompt_version: str,
-    model_version: str,
-    model_type: str,
-    cache_documents: Optional[str],
-) -> ChatResponse:
+
+def convert_to_langchain_messages(messages: list[dict[str, str]]):
+    """Helper function that converts messages into langchain messages."""
+    converted = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("message_content") or msg.get("content") or msg.get("message")
+        if role == "system":
+            converted.append(SystemMessage(content=content))
+        elif role == "user":
+            converted.append(HumanMessage(content=content))
+        elif role == "assistant":
+            converted.append(AIMessage(content=content))
+    return converted
+
+
+
+async def retrieve_answer_for_user_question(query: str, chat_history: list[dict], fonds: str):
+    """Retrieves an answer for the user question by making use of the RAG methodology."""
+    logger.info(f"Retrieving answer for query: {query} with fonds: {fonds}")
+
+    if chat_history:
+        logger.info("Chat history detected, attempting to rewrite question.")
+        query_rewritten = await rewrite_question(query=query, chat_history=chat_history)
+        logger.info(f"Rewritten query: {query_rewritten}")
+        query = query_rewritten
+
+    try:
+        filter_str = f"category == '{fonds}'"
+        sourcechunks = vector_db.search_with_query_string(query=query,
+                                                          # filter_str=filter_str
+                                                            )
+        logger.info(f"Found {len(sourcechunks[0])} source chunks.")
+        if len(sourcechunks[0]) == 0:
+            raise HTTPException(status_code=404, detail=f"No content for fonds {fonds}")
+    except Exception as e:
+        logger.error(f"Error during vector DB search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # create subchunks using sentence-based chunking to avoid overlap issues
+    subchunks = []
+    for sourcechunk in sourcechunks[0]:
+        # Use sentence-based chunking to eliminate overlap problems
+        subchunks.extend(chunk_text_by_sentences(text=sourcechunk["text"],
+                                                sourcechunk_id=str(sourcechunk["id"]),
+                                                sourcechunk_url=sourcechunk["entity"].get("source_page", "")
+                                                )
+                         )
+
+    # create context (json string with relevant keys)
+    context = create_context_from_subchunks(subchunks=subchunks)
+
+    # create messages
+    chat_history_lc = convert_to_langchain_messages(chat_history)
+    system_message = SystemMessage(content=prompt_retrieve_answer)
+    user_message = HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}")
+    messages = [system_message] + chat_history_lc + [user_message]
+
+    # use language model
+    try:
+        response = await chat_model.ainvoke(messages)
+        logger.info("Received response from chat model for answer retrieval.")
+        logger.info(f"Input for validation in retrieve_answer_for_user_question: {response.content}\ntype: {type(response.content)}")
+        answer_with_references, status_code = validate_retrieve_answer_response(response.content)
+
+    except Exception as e:
+        logger.error(f"Error parsing final answer: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if status_code == "LLM_NO_ANSWER":
+        return "0x"
+
+    # Process the answer and return it for existing footnote handling
+    # Note: The existing footnote logic in routes.py will handle the superscript conversion
+    sourcechunks_output = []
+    for sourcechunk in sourcechunks[0]:
+        sourcechunk_output = {
+            "sourcechunk_id": str(sourcechunk["id"]),
+            "sourcechunk_content": sourcechunk["text"],
+            "sourcechunk_url": sourcechunk["entity"]["source_page"],
+            "sourcechunk_category": sourcechunk["entity"]["category"],
+            "sourcechunk_kennisbank": sourcechunk["entity"]["kennisbank"]
+        }
+        sourcechunks_output.append(sourcechunk_output)
+
+    # Debug logging to verify ID consistency
+    logger.info(f"LLM_UTILS DEBUG - sourcechunk IDs in subchunks: {set(s.get('sourcechunk_id') for s in subchunks)}")
+    logger.info(f"LLM_UTILS DEBUG - sourcechunk IDs in output: {set(s.get('sourcechunk_id') for s in sourcechunks_output)}")
+
+    return answer_with_references, sourcechunks_output, subchunks
+
+
+def match_subchunks_and_add_footnote_numbers(answer: str, subchunks: list[dict]):
     """
-    Formats the response from an OpenAI model into a structured output, including
-    metadata about the model and usage statistics. The formatted response can include
-    source documents and citation information based on the model type.
-
-    Args:
-        response (OpenAIResponse): The response object from the OpenAI model containing
-        the model's answer and usage statistics.
-        completion_time (int): The time taken to complete the response, in milliseconds.
-        prompt (str): The input prompt that was provided to the model.
-        history (List[Dict[str, str]]): A list of dictionaries representing the chat history,
-        with each dictionary containing a "role" and "content".
-        prompt_version (str): The version of the prompt used in the request.
-        model_version (str): The version of the model used to generate the response.
-        model_type (str): The type of model used, such as "cache" or others.
-        cache_documents (Optional[str]): A string representing a list of cache document retrieved
-        from Azure Search database, if applicable.
-
-    Returns:
-        ChatResponse: An instance of the `ChatResponse` class containing the validated
-        and formatted response.
+    Finds subchunk metadata and adds footnote numbers to bracketed content.
+    Also validates that all footnote references exist in available subchunks.
     """
-    tmp = {
-        "answer": reformat_citations(response.choices[0].message.content),
-        "question": prompt,
-        "chat_history": history,
-    }
+    import re
+    
+    # First, validate footnote references and clean up invalid ones
+    validated_answer, warnings = validate_footnote_references(answer, subchunks)
+    
+    # Log any warnings about invalid footnotes
+    for warning in warnings:
+        logger.warning(warning)
+    
+    subchunk_matches = {}
 
-    # get source documents
-    if model_type == "cache" and cache_documents:
-        tmp["source_documents"] = ast.literal_eval(cache_documents)
-    else:
-        refs = []
-        if response.choices[0].message.context:
-            for idx, citation in enumerate(
-                response.choices[0].message.context.citations
-            ):
-                refs.append(
-                    {
-                        "id": str(idx + 1),
-                        "title": citation.title,
-                        "filepath": (
-                            "" if citation.filepath is None else citation.filepath
-                        ),
-                        "url": citation.url,
-                        "content": citation.content.encode("utf-8"),
-                    }
-                )
-        tmp["source_documents"] = refs
+    # Find all bracketed contents in the validated answer
+    matches = re.findall(r"\[(.*?)\]", validated_answer)
 
-    # metadata
-    tmp["model_info"] = {
-        "prompt_version": prompt_version if prompt_version is not None else "missing",
-        "model_version": model_version if model_version is not None else "missing",
-        "model_type": model_type if model_type is not None else "missing",
-    }
-    tmp["model_usage"] = {
-        "completion_tokens": response.usage.completion_tokens,
-        "prompt_tokens": response.usage.prompt_tokens,
-        "total_tokens": response.usage.completion_tokens + response.usage.prompt_tokens,
-        "completion_time": completion_time,
-    }
-    return ChatResponse.model_validate(tmp)
+    for i, match in enumerate(matches, start=1):
+        # Replace each bracketed content with numbered footnote format
+        footnote_marker = f"[{match}:{i}]"
+        validated_answer = validated_answer.replace(f"[{match}]", footnote_marker, 1)  # Replace only first occurrence
+        
+        # Link the match with the subchunk metadata using the footnote number as key
+        try:
+            parts = match.split(":")
+            if len(parts) >= 2:
+                sourcechunk_id = parts[0]
+                subchunk_id = parts[1]
+                
+                # Find matching subchunk
+                found_match = False
+                for subchunk in subchunks:
+                    if (str(sourcechunk_id) == str(subchunk.get("sourcechunk_id")) and 
+                        str(subchunk_id) == str(subchunk.get("subchunk_id"))):
+                        # Use the footnote number (i) as the key, not an arbitrary index
+                        subchunk_matches[i] = subchunk
+                        found_match = True
+                        break
+                
+                # Log if we couldn't find a match (this should be rare after validation)
+                if not found_match:
+                    logger.warning(f"Footnote reference [{match}] passed validation but couldn't find matching subchunk")
+                    
+        except (ValueError, IndexError):
+            # If parsing fails, skip this match
+            logger.warning(f"Failed to parse footnote reference: [{match}]")
+            continue
 
+    logger.info(f"Processed {len(matches)} footnote references, {len(subchunk_matches)} successfully linked to subchunks")
+    logger.info(f"SUBCHUNK MATCHES KEYS: {list(subchunk_matches.keys())}")
+    if warnings:
+        logger.info(f"Removed {len(warnings)} invalid footnote references")
 
+    # Convert subchunk matches to use display_text to avoid overlaps in UI
+    display_subchunk_matches = get_display_text_for_subchunk_matches(subchunk_matches)
 
+    return validated_answer, display_subchunk_matches
