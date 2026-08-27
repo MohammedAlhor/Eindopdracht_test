@@ -1,5 +1,5 @@
 Ja, precies. Mijn laatste uitleg was te versimpeld.
-
+rg -n "DocumentPreparationPipeline|similarity_search|as_retriever|get_llm|invoke\(|citation|source_page|chunk_index" application
 De **nodestructuur is de structuur van het hele document**, niet alleen van de tabel:
 
 
