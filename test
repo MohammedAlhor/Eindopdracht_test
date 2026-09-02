@@ -1,23 +1,78 @@
-cd ..
+# ============================================================
+# 1. IMPORTS
+# ============================================================
 
-if [ -d "ChatAPG_VectorDatabase/.git" ]; then
-    cd ChatAPG_VectorDatabase
-    git fetch origin
-    git switch features/BDA-32739_docint 2>/dev/null || \
-        git switch --track origin/features/BDA-32739_docint
-    git pull --ff-only
-else
-    git clone \
-      --branch features/BDA-32739_docint \
-      --single-branch \
-      "https://connectapg1@dev.azure.com/connectapg1/S05-App-Actionable_Insights/_git/ChatAPG_VectorDatabase" \
-      ChatAPG_VectorDatabase
+import inspect
+import pandas as pd
 
-    cd ChatAPG_VectorDatabase
-fi
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from sharepoint_extraction_docint import SharePointDataFetcher
 
-echo
-echo "=== READY ==="
-pwd
-git branch --show-current
-git status --short --branch
+print("✓ Imports OK")
+# ============================================================
+# 2. BESTAANDE FETCHER INITIALISEREN
+#
+# Hergebruikt bestaande:
+# - config
+# - credentials
+# - SharePoint download
+# - Document Intelligence client
+# ============================================================
+
+print("Constructor:")
+print(inspect.signature(SharePointDataFetcher))
+
+fetcher = SharePointDataFetcher()
+
+print("✓ SharePointDataFetcher klaar")
+print("✓ DI client aanwezig:", hasattr(fetcher, "docint_client"))
+
+# ============================================================
+# 3. BESTAANDE DOCUMENTFLOW GEBRUIKEN
+#
+# Geen nieuwe downloadroute bouwen.
+# Zoek de bestaande publieke entrypoint en draai die.
+# ============================================================
+
+preferred_entrypoints = [
+    "fetch",
+    "load",
+    "load_data",
+    "fetch_data",
+    "process",
+    "process_data",
+    "get_data",
+]
+
+entrypoint = next(
+    (
+        name
+        for name in preferred_entrypoints
+        if hasattr(fetcher, name) and callable(getattr(fetcher, name))
+    ),
+    None,
+)
+
+if entrypoint is None:
+    available = [
+        name
+        for name in dir(fetcher)
+        if not name.startswith("_")
+        and callable(getattr(fetcher, name))
+    ]
+    raise RuntimeError(
+        "Geen bekende publieke entrypoint gevonden.\n"
+        f"Beschikbare methods:\n{available}"
+    )
+
+print(f"✓ Gebruik bestaande entrypoint: {entrypoint}()")
+
+getattr(fetcher, entrypoint)()
+
+documents = [
+    item
+    for item in getattr(fetcher, "data_to_be_processed", [])
+    if item.get("temp_ref")
+]
+
+print(f"✓ Documenten beschikbaar: {len(documents)}")
