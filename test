@@ -1,7 +1,18 @@
 import sys
 from pathlib import Path
 
-repo_root = Path.cwd().resolve()
+start = Path.cwd().resolve()
+
+repo_root = next(
+    (
+        p for p in [start, *start.parents]
+        if (p / "application" / "vectordatabase" / "src" / "sharepoint_extraction.py").exists()
+    ),
+    None,
+)
+
+if repo_root is None:
+    raise RuntimeError("ChatAPG_VectorDatabase repo-root niet gevonden")
 
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
