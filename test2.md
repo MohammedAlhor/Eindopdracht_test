@@ -1,122 +1,208 @@
-import pytest
-from unittest.mock import Mock
-from application.milvus_search_database.src.preprocessing.document_processing import DocumentPreparationPipeline
+Top. Omdat `sharepoint_extraction_docint.py` nu **naast je notebook in de root staat**, kunnen we alle repo-/Git-/padlogica weggooien.
 
-# Mock Document class for testing
-class Document:
-    def __init__(self, page_content, metadata):
-        self.page_content = page_content
-        self.metadata = metadata
+Hier is de opgecleanede notebook in **5 stappen**. Doel: bestaande `SharePointDataFetcher` en bestaande DI-client hergebruiken, documenten via de bestaande flow ophalen, `result.tables` bekijken en één compacte inventory opleveren.
 
-    def model_copy(self):
-        return self
+### Stap 1 — Imports
 
-# Mock get_embedding_model function for testing
-def get_embedding_model():
-    model = Mock()
-    model.embed_query.return_value = [0.1, 0.2, 0.3]
-    return model
+```python
+# ============================================================
+# 1. IMPORTS
+# ============================================================
 
+import inspect
+import pandas as pd
 
-@pytest.fixture
-def mock_token_splitter():
-    splitter = Mock()
-    splitter.split_text.return_value = ["chunk1", "chunk2"]
-    return splitter
+from azure.ai.documentintelligence.models import DocumentContentFormat
+from sharepoint_extraction_docint import SharePointDataFetcher
 
-@pytest.fixture
-def pipeline(mock_token_splitter):
-    return DocumentPreparationPipeline(mock_token_splitter)
+print("✓ Imports OK")
+```
 
-def test_chunk_content(pipeline):
-    result = pipeline.chunk_content("some content")
-    assert result == [
-        {"chunk_index": 0, "chunk": "chunk1"},
-        {"chunk_index": 1, "chunk": "chunk2"}
+### Stap 2 — Bestaande fetcher initialiseren
+
+```python
+# ============================================================
+# 2. BESTAANDE CHATAPG FETCHER
+#
+# Deze klasse bevat al:
+# - configuratie
+# - credentials
+# - document-download
+# - Azure Document Intelligence client
+# ============================================================
+
+print("SharePointDataFetcher constructor:")
+print(inspect.signature(SharePointDataFetcher))
+
+fetcher = SharePointDataFetcher()
+
+print("✓ SharePointDataFetcher klaar")
+print("✓ Document Intelligence client aanwezig:", hasattr(fetcher, "docint_client"))
+```
+
+### Stap 3 — Bestaande documentflow draaien
+
+Deze cell zoekt alleen naar de bestaande publieke flow; hij bouwt **geen nieuwe downloadroute**.
+
+```python
+# ============================================================
+# 3. BESTAANDE DOCUMENTFLOW GEBRUIKEN
+# ============================================================
+
+preferred_entrypoints = [
+    "fetch",
+    "load",
+    "load_data",
+    "fetch_data",
+    "process",
+    "process_data",
+    "get_data",
+]
+
+entrypoint = next(
+    (
+        name
+        for name in preferred_entrypoints
+        if hasattr(fetcher, name) and callable(getattr(fetcher, name))
+    ),
+    None,
+)
+
+if entrypoint is None:
+    available = [
+        name
+        for name in dir(fetcher)
+        if not name.startswith("_") and callable(getattr(fetcher, name))
     ]
+    raise RuntimeError(
+        "Geen bekende publieke entrypoint gevonden.\n"
+        f"Beschikbare methods:\n{available}"
+    )
 
-def test_traverse_page_data(pipeline):
-    page_data = {
-        "version": "v1",
-        "page1": {
-            "url": "url1",
-            "content": "content1",
-            "subpages": {
-                "sub1": {
-                    "url": "url1.1",
-                    "content": "content1.1",
-                    "subpages": {},
-                    "pdf_files": {},
-                    "pdf_paths": {}
-                }
-            },
-            "pdf_files": {
-                "pdf1": "pdf content"
-            },
-            "pdf_paths": {
-                "pdf1": "url1"
-            }
-        }
-    }
+print(f"✓ Bestaande entrypoint gevonden: {entrypoint}()")
 
-    result = pipeline.traverse_page_data(page_data)
+getattr(fetcher, entrypoint)()
 
-    assert len(result) == 3  # main page, subpage, and pdf
-    assert result[0]["source_page"] == "url1"
-    assert result[1]["source_page"] == "url1.1"
-    assert result[2]["file_type"] == "pdf"
+documents = [
+    item
+    for item in getattr(fetcher, "data_to_be_processed", [])
+    if item.get("temp_ref")
+]
 
-def test_create_langchain_documents(pipeline):
-    data = [{
-        "source_page": "url1",
-        "content": "some content",
-        "page_role": "mainpage",
-        "file_type": "html",
-        "parent_page": None,
-        "version": "v1"
-    }]
+print(f"✓ Documenten beschikbaar: {len(documents)}")
+```
 
-    result = pipeline.create_langchain_documents(data)
+### Stap 4 — Document Intelligence-tabellen inventariseren
 
-    assert len(result) == 2
-    assert result[0].metadata["source_page"] == "url1"
-    assert result[0].metadata["chunk_index"] == "0"
+Dit is feitelijk jouw spike: we pakken dezelfde `prebuilt-layout` call, maar kijken nu naar `result.tables` in plaats van alleen `result.content`.
 
-def test_generate_embeddings():
-    pipeline = DocumentPreparationPipeline(token_splitter=None)
-    docs = [Document("content", {
-        "url": "url1",
-        "content_type": "html",
-        "parent_page": None,
-        "version": "v1",
-        "chunk_index": "0"
-    })]
+```python
+# ============================================================
+# 4. DOCUMENT INTELLIGENCE — TABLE INVENTORY
+# ============================================================
 
-    # Patch the embedding model
-    pipeline.get_embedding_model = get_embedding_model
-    result = pipeline.generate_embeddings(docs)
+inventory = []
 
-    assert len(result) == 1
-    assert result[0]["embedding"] == [0.1, 0.2, 0.3]
+for document_index, item in enumerate(documents, start=1):
 
-def test_prepare_data_for_vectordatabase():
-    pipeline = DocumentPreparationPipeline(token_splitter=None)
-    data = [{
-        "url": "url1",
-        "embedding": [0.1, 0.2, 0.3],
-        "content_type": "html",
-        "parent_page": None,
-        "version": "v1",
-        "chunk_index": "0"
-    }]
+    document_name = (
+        item.get("name")
+        or item.get("title")
+        or item.get("filename")
+        or item.get("temp_ref")
+    )
 
-    result = pipeline.prepare_data_for_vectordatabase(data)
+    try:
+        with open(item["temp_ref"], "rb") as f:
+            result = fetcher.docint_client.begin_analyze_document(
+                "prebuilt-layout",
+                body=f,
+                output_content_format=DocumentContentFormat.MARKDOWN,
+            ).result()
 
-    assert len(result) == 7
-    assert result[0] == [0]
-    assert result[1] == ["url1"]
-    assert result[2] == [[0.1, 0.2, 0.3]]
-    assert result[3] == ["html"]
-    assert result[4] == [None]
-    assert result[5] == ["v1"]
-    assert result[6] == ["0"]
+        for table_index, table in enumerate(result.tables or [], start=1):
+
+            cells = table.cells or []
+
+            inventory.append({
+                "document": document_name,
+                "table": table_index,
+                "rows": table.row_count,
+                "columns": table.column_count,
+                "cells": len(cells),
+
+                "header_cells": sum(
+                    getattr(cell, "kind", None)
+                    in {"columnHeader", "rowHeader", "stubHead"}
+                    for cell in cells
+                ),
+
+                "merged_cells": sum(
+                    (getattr(cell, "row_span", 1) or 1) > 1
+                    or (getattr(cell, "column_span", 1) or 1) > 1
+                    for cell in cells
+                ),
+
+                "empty_cells": sum(
+                    not (getattr(cell, "content", "") or "").strip()
+                    for cell in cells
+                ),
+            })
+
+        print(
+            f"[{document_index}/{len(documents)}] "
+            f"{document_name}: {len(result.tables or [])} tabel(len)"
+        )
+
+    except Exception as exc:
+        print(f"SKIP — {document_name}: {exc}")
+
+
+tables_df = pd.DataFrame(inventory)
+
+print("\n✓ Document Intelligence analyse afgerond")
+```
+
+### Stap 5 — Resultaat en eerste impactsignalen
+
+```python
+# ============================================================
+# 5. RESULTAAT — QUICK SCAN
+# ============================================================
+
+print("=" * 72)
+print("DOCUMENT INTELLIGENCE — TABLE IMPACT QUICK SCAN")
+print("=" * 72)
+
+print(f"Documenten bekeken : {len(documents)}")
+print(f"Tabellen gevonden  : {len(tables_df)}")
+
+if tables_df.empty:
+
+    print("\nGeen tabellen gevonden.")
+
+else:
+
+    display(tables_df)
+
+    print("\nSNELLE SIGNALEN")
+    print("-" * 40)
+
+    print(f"Grootste tabel           : {tables_df['rows'].max()} rijen")
+    print(f"Meeste kolommen          : {tables_df['columns'].max()}")
+    print(f"Tabellen met headers     : {(tables_df['header_cells'] > 0).sum()}")
+    print(f"Tabellen met merged cells: {(tables_df['merged_cells'] > 0).sum()}")
+    print(f"Tabellen met lege cellen : {(tables_df['empty_cells'] > 0).sum()}")
+
+    print("\nEERSTE IMPACT OP DE PIPELINE")
+    print("-" * 40)
+    print("1. Grote tabellen kunnen invloed hebben op chunk-grootte.")
+    print("2. Merged cells / complexe headers kunnen structuur verliezen bij flattening.")
+    print("3. Lege cellen moeten onderscheiden blijven van 0 of '-'.")
+    print("4. Headers/context moeten waarschijnlijk behouden blijven in table-nodes.")
+    print("5. Werkelijke tabelvormen bepalen of 'atomic table block' praktisch blijft.")
+```
+
+Dit is nu de notebook die ik zou bewaren als jouw **junior-DS spike**. Geen Git, geen repo-routing, geen handmatige documentpaden en geen productiecode wijzigen.
+
+Als stap 2 of 3 nog één fout geeft, hoef je daarna ook niet opnieuw het hele ontwerp te veranderen: die fout vertelt ons exact welke bestaande constructor/entrypoint jouw gekopieerde klasse gebruikt.
