@@ -1,22 +1,18 @@
-import sys
-from pathlib import Path
+# ============================================================
+# 1. IMPORTS + BESTAANDE CONFIG
+# ============================================================
 
-start = Path.cwd().resolve()
+import os
+import pandas as pd
 
-repo_root = next(
-    (
-        p for p in [start, *start.parents]
-        if (p / "application" / "vectordatabase" / "src" / "sharepoint_extraction.py").exists()
-    ),
-    None,
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import DocumentContentFormat
+
+from application.vectordatabase.utils.util_functions import (
+    load_config,
+    get_credentials,
 )
 
-if repo_root is None:
-    raise RuntimeError("ChatAPG_VectorDatabase repo-root niet gevonden")
+config = load_config(os.environ["CONFIG"])
 
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
-
-from application.vectordatabase.src.sharepoint_extraction import (
-    SharePointDataFetcher,
-)
+print("✓ Config geladen")
