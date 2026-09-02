@@ -1,44 +1,63 @@
 # ============================================================
+# DOCUMENT INTELLIGENCE – TABLE QUICK SCAN
+#
+# Doel:
+# - bestaande SharePointDataFetcher hergebruiken
+# - bestaande Document Intelligence client hergebruiken
+# - bestaande documenten laten ophalen/verwerken
+# - alleen result.tables inspecteren
+# - compacte impactanalyse maken
+#
+# Lokale bestanden naast deze notebook:
+#   sharepoint_extraction_docint.py
+#   util_functions_docint.py
+# ============================================================
+
+
+# ============================================================
 # 1. IMPORTS
 # ============================================================
 
+import sys
 import inspect
 import pandas as pd
 
-from azure.ai.documentintelligence import DocumentIntelligenceClient
+import util_functions_docint
+
+# sharepoint_extraction_docint verwacht deze oorspronkelijke modulenaam.
+# We laten hem simpelweg naar onze lokale, juiste versie wijzen.
+sys.modules[
+    "application.vectordatabase.utils.util_functions"
+] = util_functions_docint
+
 from sharepoint_extraction_docint import SharePointDataFetcher
 
 print("✓ Imports OK")
+
+
 # ============================================================
 # 2. BESTAANDE FETCHER INITIALISEREN
-#
-# Hergebruikt bestaande:
-# - config
-# - credentials
-# - SharePoint download
-# - Document Intelligence client
 # ============================================================
-
-print("Constructor:")
-print(inspect.signature(SharePointDataFetcher))
 
 fetcher = SharePointDataFetcher()
 
 print("✓ SharePointDataFetcher klaar")
-print("✓ DI client aanwezig:", hasattr(fetcher, "docint_client"))
+print("✓ Document Intelligence client:", hasattr(fetcher, "docint_client"))
+
 
 # ============================================================
-# 3. BESTAANDE DOCUMENTFLOW GEBRUIKEN
+# 3. BESTAANDE FLOW DRAAIEN
 #
-# Geen nieuwe downloadroute bouwen.
-# Zoek de bestaande publieke entrypoint en draai die.
+# We bouwen niets nieuws.
+# We pakken de bestaande publieke methode die de fetcher zelf aanbiedt.
 # ============================================================
 
-preferred_entrypoints = [
-    "fetch",
+preferred_methods = [
     "load",
-    "load_data",
+    "run",
+    "fetch",
     "fetch_data",
+    "load_data",
     "process",
     "process_data",
     "get_data",
@@ -47,27 +66,43 @@ preferred_entrypoints = [
 entrypoint = next(
     (
         name
-        for name in preferred_entrypoints
-        if hasattr(fetcher, name) and callable(getattr(fetcher, name))
+        for name in preferred_methods
+        if hasattr(fetcher, name)
+        and callable(getattr(fetcher, name))
+        and len([
+            p for p in inspect.signature(getattr(fetcher, name)).parameters.values()
+            if p.default is inspect.Parameter.empty
+            and p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]) == 0
     ),
     None,
 )
 
 if entrypoint is None:
-    available = [
-        name
-        for name in dir(fetcher)
-        if not name.startswith("_")
-        and callable(getattr(fetcher, name))
-    ]
     raise RuntimeError(
-        "Geen bekende publieke entrypoint gevonden.\n"
-        f"Beschikbare methods:\n{available}"
+        "Geen automatisch bruikbare publieke entrypoint gevonden.\n"
+        "Beschikbare publieke methods:\n"
+        + str([
+            name for name in dir(fetcher)
+            if not name.startswith("_")
+            and callable(getattr(fetcher, name))
+        ])
     )
 
-print(f"✓ Gebruik bestaande entrypoint: {entrypoint}()")
+print(f"✓ Bestaande flow: {entrypoint}()")
 
 getattr(fetcher, entrypoint)()
+
+
+# ============================================================
+# 4. DOCUMENT INTELLIGENCE TABLES OPHALEN
+#
+# De fetcher heeft documenten al gedownload naar temp_ref.
+# We gebruiken dezelfde bestaande DI-client en prebuilt-layout.
+# ============================================================
 
 documents = [
     item
@@ -76,3 +111,100 @@ documents = [
 ]
 
 print(f"✓ Documenten beschikbaar: {len(documents)}")
+
+inventory = []
+
+for document_number, item in enumerate(documents, start=1):
+
+    document_name = (
+        item.get("name")
+        or item.get("title")
+        or item.get("filename")
+        or item.get("temp_ref")
+    )
+
+    try:
+        with open(item["temp_ref"], "rb") as f:
+            result = fetcher.docint_client.begin_analyze_document(
+                "prebuilt-layout",
+                body=f,
+            ).result()
+
+        tables = result.tables or []
+
+        print(
+            f"[{document_number}/{len(documents)}] "
+            f"{document_name}: {len(tables)} tabel(len)"
+        )
+
+        for table_number, table in enumerate(tables, start=1):
+
+            cells = table.cells or []
+
+            inventory.append({
+                "document": document_name,
+                "table": table_number,
+                "rows": table.row_count,
+                "columns": table.column_count,
+                "cells": len(cells),
+
+                "headers": sum(
+                    getattr(cell, "kind", None)
+                    in {"columnHeader", "rowHeader", "stubHead"}
+                    for cell in cells
+                ),
+
+                "merged_cells": sum(
+                    (getattr(cell, "row_span", 1) or 1) > 1
+                    or (getattr(cell, "column_span", 1) or 1) > 1
+                    for cell in cells
+                ),
+
+                "empty_cells": sum(
+                    not (getattr(cell, "content", "") or "").strip()
+                    for cell in cells
+                ),
+            })
+
+    except Exception as exc:
+        print(f"SKIP: {document_name} -> {exc}")
+
+
+tables_df = pd.DataFrame(inventory)
+
+
+# ============================================================
+# 5. RESULTAAT
+# ============================================================
+
+print("\n" + "=" * 70)
+print("DOCUMENT INTELLIGENCE – TABLE QUICK SCAN")
+print("=" * 70)
+
+print(f"Documenten bekeken : {len(documents)}")
+print(f"Tabellen gevonden  : {len(tables_df)}")
+
+if tables_df.empty:
+
+    print("\nGeen tabellen gevonden.")
+
+else:
+
+    display(tables_df)
+
+    print("\nSNELLE SIGNALEN")
+    print("-" * 40)
+
+    print(f"Grootste tabel        : {tables_df['rows'].max()} rijen")
+    print(f"Meeste kolommen       : {tables_df['columns'].max()}")
+    print(f"Tabellen met headers  : {(tables_df['headers'] > 0).sum()}")
+    print(f"Tabellen met merges   : {(tables_df['merged_cells'] > 0).sum()}")
+    print(f"Tabellen met leegtes  : {(tables_df['empty_cells'] > 0).sum()}")
+
+    print("\nIMPACT OM TE ONDERZOEKEN")
+    print("-" * 40)
+    print("• omvang tabel versus maximale chunk-grootte")
+    print("• behoud van headers bij nodes/chunking")
+    print("• merged cells / complexe tabelstructuren")
+    print("• lege cel versus 0 / '-' / ontbrekende waarde")
+    print("• benodigde tabelcontext voor retrieval en LLM")
