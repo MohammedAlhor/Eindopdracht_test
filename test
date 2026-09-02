@@ -1,18 +1,23 @@
-# ============================================================
-# 1. IMPORTS + BESTAANDE CONFIG
-# ============================================================
+cd ..
 
-import os
-import pandas as pd
+if [ -d "ChatAPG_VectorDatabase/.git" ]; then
+    cd ChatAPG_VectorDatabase
+    git fetch origin
+    git switch features/BDA-32739_docint 2>/dev/null || \
+        git switch --track origin/features/BDA-32739_docint
+    git pull --ff-only
+else
+    git clone \
+      --branch features/BDA-32739_docint \
+      --single-branch \
+      "https://connectapg1@dev.azure.com/connectapg1/S05-App-Actionable_Insights/_git/ChatAPG_VectorDatabase" \
+      ChatAPG_VectorDatabase
 
-from azure.ai.documentintelligence import DocumentIntelligenceClient
-from azure.ai.documentintelligence.models import DocumentContentFormat
+    cd ChatAPG_VectorDatabase
+fi
 
-from application.vectordatabase.utils.util_functions import (
-    load_config,
-    get_credentials,
-)
-
-config = load_config(os.environ["CONFIG"])
-
-print("✓ Config geladen")
+echo
+echo "=== READY ==="
+pwd
+git branch --show-current
+git status --short --branch
