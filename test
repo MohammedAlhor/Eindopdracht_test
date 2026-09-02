@@ -1,48 +1,86 @@
-site_base_url = config["sharepoint"]["sharepoint_site"]
-page_relative_url = "SitePages/Werkafspraken%20-%20Doorlooptijden.aspx"
+import pandas as pd
+from bs4 import BeautifulSoup
 
-canvas_content = get_sitepage_canvas(
-    page_relative_url=page_relative_url,
-    base_url=site_base_url,
-)
+# Hergebruik wat al in je notebook/project bestaat:
+# - headers
+# - site_base_url
+# - get_sitepage_canvas(...)
+# - md_tight(...)
 
-markdown_content = convert_sitepage_to_markdown(
-    canvas=canvas_content,
-    site_base_url=site_base_url,
-)
+def get_all_sitepages():
+    url = (
+        f"{site_base_url}/_api/web/lists/getbytitle('Site Pages')/items"
+        "?$select=Title,FileRef&$top=5000"
+    )
 
-table_controls = []
+    pages = []
 
-for i, control in enumerate(canvas_content):
-    if control.get("controlType") != 4:
+    while url:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+
+        data = response.json()["d"]
+        pages.extend(data["results"])
+        url = data.get("__next")
+
+    return pages
+
+
+tables = []
+
+for page in get_all_sitepages():
+
+    page_url = page["FileRef"]
+    relative_url = page_url.split("/SitePages/", 1)[-1]
+    relative_url = f"SitePages/{relative_url}"
+
+    try:
+        canvas = get_sitepage_canvas(
+            base_url=site_base_url,
+            page_relative_url=relative_url,
+        )
+    except Exception as e:
+        print(f"SKIP: {relative_url} -> {e}")
         continue
 
-    inner_html = control.get("innerHTML", "") or ""
+    table_number = 0
 
-    if "<table" in inner_html.lower():
-        table_controls.append(
-            {
-                "control_index": i,
-                "control_id": control.get("id"),
-                "html": inner_html,
+    for control in canvas:
+
+        if control.get("controlType") != 4:
+            continue
+
+        html = control.get("innerHTML", "") or ""
+        soup = BeautifulSoup(html, "html.parser")
+
+        for html_table in soup.find_all("table"):
+
+            table_number += 1
+
+            rows = html_table.find_all("tr")
+            cells_per_row = [
+                len(row.find_all(["th", "td"]))
+                for row in rows
+            ]
+
+            tables.append({
+                "page_title": page.get("Title"),
+                "page_url": page_url,
+                "table_number": table_number,
+                "rows": len(rows),
+                "columns": max(cells_per_row, default=0),
                 "markdown": md_tight(
-                    inner_html,
+                    str(html_table),
                     base_url=site_base_url,
                 ),
-            }
-        )
+                "html": str(html_table),
+            })
 
-print(f"Aantal canvas-controls: {len(canvas_content)}")
-print(f"Aantal controls met tabel(len): {len(table_controls)}")
 
-for i, table in enumerate(table_controls, start=1):
-    print("\n" + "=" * 100)
-    print(f"TABEL-CONTROL {i}")
-    print(f"control_index: {table['control_index']}")
-    print(f"control_id:    {table['control_id']}")
+tables_df = pd.DataFrame(tables)
 
-    print("\nRAW HTML:")
-    print(table["html"])
+print(f"Pagina's onderzocht : {len(get_all_sitepages())}")
+print(f"Tabellen gevonden   : {len(tables_df)}")
+print(f"Pagina's met tabel  : {tables_df['page_url'].nunique() if len(tables_df) else 0}")
 
-    print("\nMARKDOWN:")
-    print(table["markdown"])
+tables_df
