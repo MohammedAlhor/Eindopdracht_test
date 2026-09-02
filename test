@@ -1,13 +1,31 @@
 # ============================================================
-# DOCUMENT INTELLIGENCE – TABLE QUICK SCAN
-#
-# Doel:
-# - Hergebruik de bestaande ChatAPG / SharePointDataFetcher-route
-# - Laat de bestaande pipeline documenten ophalen
-# - Bekijk direct welke tabellen Azure Document Intelligence vindt
-# - Geen wijzigingen aan productiecode
+# NOTEBOOK BOOTSTRAP
+# Zorg dat deze Jupyter-kernel dezelfde DI dependency heeft
+# als de bestaande ChatAPG-code.
 # ============================================================
 
+import sys
+import subprocess
+import importlib.util
+
+required_packages = {
+    "azure.ai.documentintelligence": "azure-ai-documentintelligence",
+}
+
+for module, package in required_packages.items():
+    if importlib.util.find_spec(module) is None:
+        print(f"Installing missing dependency: {package}")
+        subprocess.check_call([
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            package,
+        ])
+
+print("✓ Document Intelligence dependency beschikbaar")
+
+# Imports die we daarna nodig hebben
 import pandas as pd
 
 from azure.ai.documentintelligence.models import DocumentContentFormat
@@ -16,106 +34,5 @@ from application.vectordatabase.src.preprocessing.sharepoint_extraction import (
     SharePointDataFetcher,
 )
 
-
-# ------------------------------------------------------------
-# 1. Gebruik de bestaande project-fetcher
-#    Config, credentials, DI-client en document-download zitten hierin al.
-# ------------------------------------------------------------
-
-fetcher = SharePointDataFetcher()
-
-
-# ------------------------------------------------------------
-# 2. Gebruik de bestaande fetch/download-route
-# ------------------------------------------------------------
-
-fetcher.fetch()
-
-documents = [
-    item
-    for item in fetcher.data_to_be_processed
-    if item.get("temp_ref")
-    and item.get("file_type") == "document"
-]
-
-
-# ------------------------------------------------------------
-# 3. Draai dezelfde Document Intelligence-call als de pipeline
-# ------------------------------------------------------------
-
-results = []
-
-for item in documents:
-    with open(item["temp_ref"], "rb") as f:
-        result = fetcher.docint_client.begin_analyze_document(
-            "prebuilt-layout",
-            body=f,
-            output_content_format=DocumentContentFormat.MARKDOWN,
-        ).result()
-
-    results.append((item, result))
-
-
-# ------------------------------------------------------------
-# 4. Maak compacte tabel-inventory
-# ------------------------------------------------------------
-
-inventory = []
-
-for item, result in results:
-    for table_index, table in enumerate(result.tables or [], start=1):
-
-        cells = table.cells or []
-
-        inventory.append({
-            "document": item.get("name")
-                        or item.get("title")
-                        or item.get("temp_ref"),
-            "table": table_index,
-            "rows": table.row_count,
-            "columns": table.column_count,
-
-            "header_cells": sum(
-                getattr(cell, "kind", None)
-                in {"columnHeader", "rowHeader", "stubHead"}
-                for cell in cells
-            ),
-
-            "merged_cells": sum(
-                (getattr(cell, "row_span", 1) or 1) > 1
-                or (getattr(cell, "column_span", 1) or 1) > 1
-                for cell in cells
-            ),
-
-            "empty_cells": sum(
-                not (getattr(cell, "content", "") or "").strip()
-                for cell in cells
-            ),
-        })
-
-
-tables_df = pd.DataFrame(inventory)
-
-
-# ------------------------------------------------------------
-# 5. Resultaat
-# ------------------------------------------------------------
-
-print("=" * 70)
-print("DOCUMENT INTELLIGENCE – TABLE QUICK SCAN")
-print("=" * 70)
-
-print(f"Documenten bekeken : {len(results)}")
-print(f"Tabellen gevonden  : {len(tables_df)}")
-
-if tables_df.empty:
-    print("\nGeen tabellen gevonden.")
-else:
-    display(tables_df)
-
-    print("\nSNELLE SIGNALEN")
-    print(f"- Grootste tabel       : {tables_df['rows'].max()} rijen")
-    print(f"- Meeste kolommen      : {tables_df['columns'].max()}")
-    print(f"- Tabellen met headers : {(tables_df['header_cells'] > 0).sum()}")
-    print(f"- Tabellen met merges  : {(tables_df['merged_cells'] > 0).sum()}")
-    print(f"- Tabellen met leegtes : {(tables_df['empty_cells'] > 0).sum()}")
+print("✓ Azure DI import werkt")
+print("✓ SharePointDataFetcher import werkt")
