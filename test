@@ -1,38 +1,25 @@
 # ============================================================
-# NOTEBOOK BOOTSTRAP
-# Zorg dat deze Jupyter-kernel dezelfde DI dependency heeft
-# als de bestaande ChatAPG-code.
+# NOTEBOOK BOOTSTRAP — Azure Document Intelligence
 # ============================================================
 
 import sys
 import subprocess
-import importlib.util
 
-required_packages = {
-    "azure.ai.documentintelligence": "azure-ai-documentintelligence",
-}
+try:
+    from azure.ai.documentintelligence.models import DocumentContentFormat
+    print("✓ Azure Document Intelligence is al beschikbaar")
 
-for module, package in required_packages.items():
-    if importlib.util.find_spec(module) is None:
-        print(f"Installing missing dependency: {package}")
-        subprocess.check_call([
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            package,
-        ])
+except ModuleNotFoundError:
+    print("Azure Document Intelligence ontbreekt — installeren...")
 
-print("✓ Document Intelligence dependency beschikbaar")
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "azure-ai-documentintelligence",
+    ])
 
-# Imports die we daarna nodig hebben
-import pandas as pd
+    from azure.ai.documentintelligence.models import DocumentContentFormat
 
-from azure.ai.documentintelligence.models import DocumentContentFormat
-
-from application.vectordatabase.src.preprocessing.sharepoint_extraction import (
-    SharePointDataFetcher,
-)
-
-print("✓ Azure DI import werkt")
-print("✓ SharePointDataFetcher import werkt")
+    print("✓ Azure Document Intelligence geïnstalleerd en geïmporteerd")
