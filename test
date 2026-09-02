@@ -1,4 +1,16 @@
-# Zoek alle text/webpart-controls waarin een HTML-tabel voorkomt
+site_base_url = config["sharepoint"]["sharepoint_site"]
+page_relative_url = "SitePages/Werkafspraken%20-%20Doorlooptijden.aspx"
+
+canvas_content = get_sitepage_canvas(
+    page_relative_url=page_relative_url,
+    base_url=site_base_url,
+)
+
+markdown_content = convert_sitepage_to_markdown(
+    canvas=canvas_content,
+    site_base_url=site_base_url,
+)
+
 table_controls = []
 
 for i, control in enumerate(canvas_content):
@@ -15,7 +27,7 @@ for i, control in enumerate(canvas_content):
                 "html": inner_html,
                 "markdown": md_tight(
                     inner_html,
-                    base_url=base_url,
+                    base_url=site_base_url,
                 ),
             }
         )
