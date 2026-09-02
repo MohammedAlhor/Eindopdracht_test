@@ -1,25 +1,26 @@
 # ============================================================
-# NOTEBOOK BOOTSTRAP — Azure Document Intelligence
+# PREFLIGHT — na Kernel Restart
 # ============================================================
 
-import sys
-import subprocess
+import inspect
 
-try:
-    from azure.ai.documentintelligence.models import DocumentContentFormat
-    print("✓ Azure Document Intelligence is al beschikbaar")
+from azure.ai.documentintelligence.models import DocumentContentFormat
 
-except ModuleNotFoundError:
-    print("Azure Document Intelligence ontbreekt — installeren...")
+from application.vectordatabase.src.preprocessing.sharepoint_extraction import (
+    SharePointDataFetcher,
+)
 
-    subprocess.check_call([
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "azure-ai-documentintelligence",
+print("✓ Azure Document Intelligence beschikbaar")
+print("✓ SharePointDataFetcher beschikbaar")
+
+# Meteen vooruitkijken of onze aannames over de bestaande fetcher kloppen
+print("\nConstructor:")
+print(inspect.signature(SharePointDataFetcher))
+
+print("\nRelevante bestaande methods:")
+print([
+    name for name in dir(SharePointDataFetcher)
+    if any(word in name.lower() for word in [
+        "fetch", "download", "document", "markdown", "load"
     ])
-
-    from azure.ai.documentintelligence.models import DocumentContentFormat
-
-    print("✓ Azure Document Intelligence geïnstalleerd en geïmporteerd")
+])
