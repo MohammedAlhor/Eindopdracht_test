@@ -1,147 +1,36 @@
-import re
+# Zoek alle text/webpart-controls waarin een HTML-tabel voorkomt
+table_controls = []
 
-from application.models.chat_model import get_chat_model
+for i, control in enumerate(canvas_content):
+    if control.get("controlType") != 4:
+        continue
 
+    inner_html = control.get("innerHTML", "") or ""
 
-PROJECT_INPUT = {
-    "title": "Fictieve pensioenpercentages 2026",
-    "source_page": "demo://pensioen-2026",
-    "section": "Premies 2026",
-    "table_id": "table-premies-2026",
-    "table_title": "Premiepercentages 2026",
-    "column_count": 4,
-    "text_before": "De percentages gelden vanaf 1 januari 2026.",
-    "content": """Regeling | OP 2026 | RP 2026 | Totaal 2026 |
-Regeling A | 22,00% | 3,93% | 25,93% |
-Regeling B | 22,00% | 3,73% | 25,73% |
-Regeling C | 24,00% | | 24,00% |
-Regeling D | 21,00% | - | 21,00% |
-Regeling E | 20,00% | 3,20% | 23,20% |""".replace("\n", " "),
-    "text_after": "Een streepje is niet hetzelfde als nul of een lege cel.",
-}
-
-QUESTION = (
-    "Wat is RP 2026 voor Regeling B? Vergelijk daarna het totaal van Regeling B "
-    "met Regeling E. Leg ook uit wat bij RP 2026 voor Regeling C staat."
-)
-
-
-def _split_values(text):
-    stripped = text.strip()
-    values = [value.strip() for value in stripped.split("|")]
-    if stripped.startswith("|") and values[0] == "":
-        values.pop(0)
-    if stripped.endswith("|") and values[-1] == "":
-        values.pop()
-    return values
-
-
-def parse_flattened_table(content, column_count):
-    if not isinstance(content, str) or not content.strip():
-        raise ValueError("content must be a non-empty string")
-    if not isinstance(column_count, int) or column_count < 2:
-        raise ValueError("column_count must be an integer of at least 2")
-
-    lines = [line for line in content.splitlines() if line.strip()]
-    if len(lines) > 1:
-        values_per_line = [_split_values(line) for line in lines]
-        if any(len(values) != column_count for values in values_per_line):
-            raise ValueError("each table row must contain column_count values")
-        headers = values_per_line[0]
-        rows = values_per_line[1:]
-    else:
-        values = _split_values(content)
-        if len(values) < column_count * 2 or len(values) % column_count:
-            raise ValueError("flattened table does not match column_count")
-        headers = values[:column_count]
-        rows = [
-            values[index : index + column_count]
-            for index in range(column_count, len(values), column_count)
-        ]
-
-    separator = re.compile(r"^:?-{3,}:?$")
-    if rows and all(separator.fullmatch(value) for value in rows[0]):
-        rows = rows[1:]
-    if not rows:
-        raise ValueError("table must contain at least one data row")
-    return headers, rows
-
-
-def build_row_nodes(project_input):
-    headers, rows = parse_flattened_table(
-        project_input["content"],
-        project_input["column_count"],
-    )
-    nodes = []
-    for row_index, values in enumerate(rows):
-        cells = [
+    if "<table" in inner_html.lower():
+        table_controls.append(
             {
-                "node_id": f"{project_input['table_id']}-r{row_index}-c{column_index}",
-                "column_index": column_index,
-                "column_name": headers[column_index],
-                "raw_value": value,
-                "missing": value == "",
-            }
-            for column_index, value in enumerate(values)
-        ]
-        displayed_values = ["—" if value == "" else value for value in values]
-        markdown = "\n".join(
-            [
-                "| " + " | ".join(headers) + " |",
-                "| " + " | ".join("---" for _ in headers) + " |",
-                "| " + " | ".join(displayed_values) + " |",
-            ]
-        )
-        nodes.append(
-            {
-                "node_id": f"{project_input['table_id']}-r{row_index}",
-                "node_type": "table_row",
-                "table_id": project_input["table_id"],
-                "row_index": row_index,
-                "cells": cells,
-                "content": (
-                    f"Document: {project_input['title']}\n"
-                    f"Sectie: {project_input['section']}\n"
-                    f"Tabel: {project_input['table_title']}\n\n"
-                    f"{markdown}"
+                "control_index": i,
+                "control_id": control.get("id"),
+                "html": inner_html,
+                "markdown": md_tight(
+                    inner_html,
+                    base_url=base_url,
                 ),
             }
         )
-    return nodes
 
+print(f"Aantal canvas-controls: {len(canvas_content)}")
+print(f"Aantal controls met tabel(len): {len(table_controls)}")
 
-def build_prompt(project_input, row_nodes, question):
-    rows = "\n\n".join(node["content"] for node in row_nodes)
-    return f"""Beantwoord de vraag uitsluitend met de bron hieronder.
-Een tabelwaarde — betekent dat de oorspronkelijke cel leeg was en geen waarde vermeldde.
-Een waarde 0 is nul. Een waarde - is een letterlijk streepje uit de bron.
+for i, table in enumerate(table_controls, start=1):
+    print("\n" + "=" * 100)
+    print(f"TABEL-CONTROL {i}")
+    print(f"control_index: {table['control_index']}")
+    print(f"control_id:    {table['control_id']}")
 
-Tekst vóór de tabel:
-{project_input['text_before']}
+    print("\nRAW HTML:")
+    print(table["html"])
 
-Tabelrijen:
-{rows}
-
-Tekst na de tabel:
-{project_input['text_after']}
-
-Vraag:
-{question}
-"""
-
-
-def main():
-    row_nodes = build_row_nodes(PROJECT_INPUT)
-
-    assert row_nodes[2]["cells"][2]["raw_value"] == ""
-    assert row_nodes[2]["cells"][2]["missing"] is True
-    assert row_nodes[3]["cells"][2]["raw_value"] == "-"
-    assert row_nodes[3]["cells"][2]["missing"] is False
-
-    prompt = build_prompt(PROJECT_INPUT, row_nodes, QUESTION)
-    response = get_chat_model().invoke(prompt)
-    print(response.content)
-
-
-if __name__ == "__main__":
-    main()
+    print("\nMARKDOWN:")
+    print(table["markdown"])
