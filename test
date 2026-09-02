@@ -1,88 +1,121 @@
+# ============================================================
+# DOCUMENT INTELLIGENCE – TABLE QUICK SCAN
+#
+# Doel:
+# - Hergebruik de bestaande ChatAPG / SharePointDataFetcher-route
+# - Laat de bestaande pipeline documenten ophalen
+# - Bekijk direct welke tabellen Azure Document Intelligence vindt
+# - Geen wijzigingen aan productiecode
+# ============================================================
+
 import pandas as pd
-from bs4 import BeautifulSoup
 
-# Gebruik je bestaande site_base_url, maar maak hem requests-proof
-site_base_url_http = site_base_url.rstrip("/")
+from azure.ai.documentintelligence.models import DocumentContentFormat
 
-if not site_base_url_http.startswith(("http://", "https://")):
-    site_base_url_http = "https://" + site_base_url_http
-
-
-def get_all_sitepages():
-    url = (
-        f"{site_base_url_http}/_api/web/lists/getbytitle('Site Pages')/items"
-        "?$select=Title,FileRef&$top=5000"
-    )
-
-    pages = []
-
-    while url:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-
-        data = response.json()["d"]
-        pages.extend(data["results"])
-        url = data.get("__next")
-
-    return pages
-
-
-pages = get_all_sitepages()
-tables = []
-
-for page in pages:
-    page_url = page["FileRef"]
-
-    if "/SitePages/" not in page_url:
-        continue
-
-    page_relative_url = "SitePages/" + page_url.split("/SitePages/", 1)[1]
-
-    try:
-        canvas = get_sitepage_canvas(
-            base_url=site_base_url_http,
-            page_relative_url=page_relative_url,
-        )
-    except Exception as e:
-        print(f"SKIP: {page_relative_url} -> {e}")
-        continue
-
-    for control_index, control in enumerate(canvas):
-        if control.get("controlType") != 4:
-            continue
-
-        inner_html = control.get("innerHTML", "") or ""
-        soup = BeautifulSoup(inner_html, "html.parser")
-
-        for table_index, html_table in enumerate(soup.find_all("table"), start=1):
-            rows = html_table.find_all("tr")
-            cells_per_row = [
-                len(row.find_all(["th", "td"]))
-                for row in rows
-            ]
-
-            tables.append({
-                "page_title": page.get("Title"),
-                "page_url": page_url,
-                "control_index": control_index,
-                "table_index": table_index,
-                "rows": len(rows),
-                "columns": max(cells_per_row, default=0),
-                "markdown": md_tight(
-                    str(html_table),
-                    base_url=site_base_url_http,
-                ),
-                "html": str(html_table),
-            })
-
-
-tables_df = pd.DataFrame(tables)
-
-print(f"Pagina's onderzocht : {len(pages)}")
-print(f"Tabellen gevonden   : {len(tables_df)}")
-print(
-    f"Pagina's met tabel  : "
-    f"{tables_df['page_url'].nunique() if not tables_df.empty else 0}"
+from application.vectordatabase.src.preprocessing.sharepoint_extraction import (
+    SharePointDataFetcher,
 )
 
-tables_df
+
+# ------------------------------------------------------------
+# 1. Gebruik de bestaande project-fetcher
+#    Config, credentials, DI-client en document-download zitten hierin al.
+# ------------------------------------------------------------
+
+fetcher = SharePointDataFetcher()
+
+
+# ------------------------------------------------------------
+# 2. Gebruik de bestaande fetch/download-route
+# ------------------------------------------------------------
+
+fetcher.fetch()
+
+documents = [
+    item
+    for item in fetcher.data_to_be_processed
+    if item.get("temp_ref")
+    and item.get("file_type") == "document"
+]
+
+
+# ------------------------------------------------------------
+# 3. Draai dezelfde Document Intelligence-call als de pipeline
+# ------------------------------------------------------------
+
+results = []
+
+for item in documents:
+    with open(item["temp_ref"], "rb") as f:
+        result = fetcher.docint_client.begin_analyze_document(
+            "prebuilt-layout",
+            body=f,
+            output_content_format=DocumentContentFormat.MARKDOWN,
+        ).result()
+
+    results.append((item, result))
+
+
+# ------------------------------------------------------------
+# 4. Maak compacte tabel-inventory
+# ------------------------------------------------------------
+
+inventory = []
+
+for item, result in results:
+    for table_index, table in enumerate(result.tables or [], start=1):
+
+        cells = table.cells or []
+
+        inventory.append({
+            "document": item.get("name")
+                        or item.get("title")
+                        or item.get("temp_ref"),
+            "table": table_index,
+            "rows": table.row_count,
+            "columns": table.column_count,
+
+            "header_cells": sum(
+                getattr(cell, "kind", None)
+                in {"columnHeader", "rowHeader", "stubHead"}
+                for cell in cells
+            ),
+
+            "merged_cells": sum(
+                (getattr(cell, "row_span", 1) or 1) > 1
+                or (getattr(cell, "column_span", 1) or 1) > 1
+                for cell in cells
+            ),
+
+            "empty_cells": sum(
+                not (getattr(cell, "content", "") or "").strip()
+                for cell in cells
+            ),
+        })
+
+
+tables_df = pd.DataFrame(inventory)
+
+
+# ------------------------------------------------------------
+# 5. Resultaat
+# ------------------------------------------------------------
+
+print("=" * 70)
+print("DOCUMENT INTELLIGENCE – TABLE QUICK SCAN")
+print("=" * 70)
+
+print(f"Documenten bekeken : {len(results)}")
+print(f"Tabellen gevonden  : {len(tables_df)}")
+
+if tables_df.empty:
+    print("\nGeen tabellen gevonden.")
+else:
+    display(tables_df)
+
+    print("\nSNELLE SIGNALEN")
+    print(f"- Grootste tabel       : {tables_df['rows'].max()} rijen")
+    print(f"- Meeste kolommen      : {tables_df['columns'].max()}")
+    print(f"- Tabellen met headers : {(tables_df['header_cells'] > 0).sum()}")
+    print(f"- Tabellen met merges  : {(tables_df['merged_cells'] > 0).sum()}")
+    print(f"- Tabellen met leegtes : {(tables_df['empty_cells'] > 0).sum()}")
