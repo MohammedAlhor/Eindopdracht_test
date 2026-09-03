@@ -1,7 +1,213 @@
-with open(item["temp_ref"], "rb") as f:
-    poller = self.docint_client.begin_analyze_document(
-        "prebuilt-layout",
-        body=f,
-        output_content_format=DocumentContentFormat.MARKDOWN,
+Ja. Ik trek hem nu terug naar één notebook zonder Git-/repo-/method-gokwerk.
+
+Deze versie gebruikt wat we inmiddels **bewezen** hebben uit jouw branch:
+
+* `SharePointDataFetcher` werkt;
+* juiste `config/config.yml`;
+* `docint_client` zit al in de fetcher;
+* documenten komen uiteindelijk als items met `temp_ref`;
+* DI gebruikt `prebuilt-layout`;
+* jouw onderzoek zit bij `result.tables`;
+* we schrijven niets naar vector DB en wijzigen geen productiecode.
+
+Het enige adaptieve stukje is dat de notebook zelf de vereiste parameters van `retrieve_sharepoint_data_incremental()` afleidt in plaats van dat wij ze opnieuw gokken.
+
+### Cel 1 — setup
+
+```python
+# ============================================================
+# 1. SETUP
+# ============================================================
+
+import os
+import inspect
+from datetime import date, timedelta
+
+import pandas as pd
+
+os.environ["CONFIG"] = "config/config.yml"
+
+from sharepoint_extraction import SharePointDataFetcher
+
+fetcher = SharePointDataFetcher()
+
+print("✓ SharePointDataFetcher klaar")
+print("✓ Document Intelligence client:", hasattr(fetcher, "docint_client"))
+```
+
+### Cel 2 — bestaande SharePoint-flow gebruiken
+
+```python
+# ============================================================
+# 2. BESTAANDE DOCUMENTFLOW
+# ============================================================
+
+method = fetcher.retrieve_sharepoint_data_incremental
+signature = inspect.signature(method)
+
+kwargs = {}
+
+for name, parameter in signature.parameters.items():
+
+    if parameter.default is not inspect.Parameter.empty:
+        continue
+
+    # Gebruik eerst een bestaande waarde van de fetcher zelf
+    if hasattr(fetcher, name):
+        kwargs[name] = getattr(fetcher, name)
+        continue
+
+    # Date-parameters automatisch invullen voor deze read-only spike
+    lower = name.lower()
+
+    if "date" in lower:
+        if any(x in lower for x in ["start", "from", "since", "previous"]):
+            kwargs[name] = date.today() - timedelta(days=30)
+        else:
+            kwargs[name] = date.today()
+        continue
+
+    raise RuntimeError(
+        f"Kan vereiste parameter '{name}' niet veilig automatisch invullen. "
+        f"Signature: {signature}"
     )
-    result = poller.result()
+
+print("Call:", signature)
+print("Parameters:", kwargs)
+
+method(**kwargs)
+
+documents = [
+    item
+    for item in fetcher.data_to_be_processed
+    if item.get("temp_ref")
+]
+
+print(f"✓ Documenten beschikbaar: {len(documents)}")
+```
+
+### Cel 3 — Document Intelligence tabellen ophalen
+
+```python
+# ============================================================
+# 3. DOCUMENT INTELLIGENCE TABLES
+# ============================================================
+
+results = []
+
+for i, item in enumerate(documents, start=1):
+
+    name = (
+        item.get("name")
+        or item.get("title")
+        or item.get("filename")
+        or item.get("temp_ref")
+    )
+
+    try:
+        with open(item["temp_ref"], "rb") as f:
+            result = fetcher.docint_client.begin_analyze_document(
+                "prebuilt-layout",
+                body=f,
+            ).result()
+
+        results.append((name, result))
+
+        print(
+            f"[{i}/{len(documents)}] "
+            f"{name}: {len(result.tables or [])} tabel(len)"
+        )
+
+    except Exception as exc:
+        print(f"SKIP: {name} -> {exc}")
+
+print(f"\n✓ Documenten door DI gehaald: {len(results)}")
+```
+
+### Cel 4 — inventory maken
+
+```python
+# ============================================================
+# 4. TABLE INVENTORY
+# ============================================================
+
+inventory = []
+
+for document_name, result in results:
+
+    for table_number, table in enumerate(result.tables or [], start=1):
+
+        cells = table.cells or []
+
+        inventory.append({
+            "document": document_name,
+            "table": table_number,
+
+            "rows": table.row_count,
+            "columns": table.column_count,
+            "cells": len(cells),
+
+            "header_cells": sum(
+                getattr(cell, "kind", None)
+                in {"columnHeader", "rowHeader", "stubHead"}
+                for cell in cells
+            ),
+
+            "merged_cells": sum(
+                (getattr(cell, "row_span", 1) or 1) > 1
+                or (getattr(cell, "column_span", 1) or 1) > 1
+                for cell in cells
+            ),
+
+            "empty_cells": sum(
+                not (getattr(cell, "content", "") or "").strip()
+                for cell in cells
+            ),
+        })
+
+tables_df = pd.DataFrame(inventory)
+
+print(f"✓ Tabellen geïnventariseerd: {len(tables_df)}")
+```
+
+### Cel 5 — resultaat voor je spike
+
+```python
+# ============================================================
+# 5. RESULTATEN / EERSTE IMPACTSCAN
+# ============================================================
+
+print("=" * 70)
+print("DOCUMENT INTELLIGENCE — TABLE IMPACT SCAN")
+print("=" * 70)
+
+print(f"Documenten geanalyseerd : {len(results)}")
+print(f"Tabellen gevonden       : {len(tables_df)}")
+
+if tables_df.empty:
+
+    print("\nGeen tabellen gevonden.")
+
+else:
+
+    display(tables_df)
+
+    print("\nSNELLE SIGNALEN")
+    print("-" * 40)
+
+    print(f"Grootste tabel           : {tables_df['rows'].max()} rijen")
+    print(f"Meeste kolommen          : {tables_df['columns'].max()}")
+    print(f"Tabellen met headers     : {(tables_df['header_cells'] > 0).sum()}")
+    print(f"Tabellen met merged cells: {(tables_df['merged_cells'] > 0).sum()}")
+    print(f"Tabellen met lege cellen : {(tables_df['empty_cells'] > 0).sum()}")
+
+    print("\nRELEVANT VOOR VERVOLG")
+    print("- omvang versus chunk size")
+    print("- behoud van headers/context in nodes")
+    print("- merged cells / complexe headers")
+    print("- lege cel versus 0 / '-' / ontbrekende waarde")
+    print("- atomic table block versus grote tabellen")
+    print("- impact op retrieval en betekenis voor het LLM")
+```
+
+Dit is nu de scope die ik zou aanhouden: **geen table-RAG bouwen, geen nodes implementeren, geen pipeline veranderen.** Eerst echte DI-tabellen verzamelen en met bewijs vaststellen welke huidige aannames geraakt worden.
