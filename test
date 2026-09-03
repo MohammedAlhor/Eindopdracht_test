@@ -1,26 +1,43 @@
 from datetime import date, timedelta
 
-sites = fetcher.config_paths["sharepoint_sites"]
+# Gebruik de site-context die al bewezen werkt
+kennisbank = "PU"
+category = "PWRI"
 
-print("Beschikbare kennisbanken/categories:")
-for kb, categories in sites.items():
-    print(f"- {kb}: {list(categories.keys())}")
+documents = []
 
-# Voor deze spike:
-kennisbank = next(iter(sites))
-category = next(iter(sites[kennisbank]))
+# Zoek terug in de tijd, maar stop zodra we 3 documenten hebben
+for days_back in range(1, 31):
 
-print("\nGebruik:")
-print("kennisbank =", kennisbank)
-print("category   =", category)
+    sync_date = date.today() - timedelta(days=days_back)
 
-processed, skipped = fetcher.retrieve_sharepoint_data_incremental(
-    kennisbank=kennisbank,
-    category=category,
-    sync_date=date.today() - timedelta(days=1),
-)
+    print(f"Check {sync_date}...")
 
-print("\n✓ Ophalen klaar")
-print("Processed:", len(processed))
-print("Skipped  :", len(skipped))
-print("Data to process:", len(fetcher.data_to_be_processed))
+    processed, skipped = fetcher.retrieve_sharepoint_data_incremental(
+        kennisbank=kennisbank,
+        category=category,
+        sync_date=sync_date,
+    )
+
+    found = [
+        item
+        for item in fetcher.data_to_be_processed
+        if item.get("temp_ref")
+    ]
+
+    documents.extend(found)
+
+    # duplicaten eruit
+    documents = list({
+        item["temp_ref"]: item
+        for item in documents
+    }.values())
+
+    if len(documents) >= 3:
+        documents = documents[:3]
+        break
+
+print(f"\n✓ Testset klaar: {len(documents)} documenten")
+
+for i, item in enumerate(documents, 1):
+    print(i, item.get("name") or item.get("title") or item.get("temp_ref"))
