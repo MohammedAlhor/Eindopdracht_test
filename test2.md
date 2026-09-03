@@ -1,208 +1,164 @@
-Top. Omdat `sharepoint_extraction_docint.py` nu **naast je notebook in de root staat**, kunnen we alle repo-/Git-/padlogica weggooien.
+Mooi. Dan is je doel nu scherp genoeg. We gebruiken **geen incremental/datumroute**, wijzigen **geen productiecode**, kiezen automatisch maximaal **5 bestaande documenten**, gebruiken de bestaande downloader + DI-client en geven alleen een compacte inventory en impactsignalen.
 
-Hier is de opgecleanede notebook in **5 stappen**. Doel: bestaande `SharePointDataFetcher` en bestaande DI-client hergebruiken, documenten via de bestaande flow ophalen, `result.tables` bekijken en één compacte inventory opleveren.
-
-### Stap 1 — Imports
+Gebruik dit als je opgeschoonde notebook:
 
 ```python
 # ============================================================
-# 1. IMPORTS
+# 1. SETUP
 # ============================================================
 
-import inspect
+import os
 import pandas as pd
 
-from azure.ai.documentintelligence.models import DocumentContentFormat
-from sharepoint_extraction_docint import SharePointDataFetcher
+os.environ["CONFIG"] = "config/config.yml"
 
-print("✓ Imports OK")
-```
-
-### Stap 2 — Bestaande fetcher initialiseren
-
-```python
-# ============================================================
-# 2. BESTAANDE CHATAPG FETCHER
-#
-# Deze klasse bevat al:
-# - configuratie
-# - credentials
-# - document-download
-# - Azure Document Intelligence client
-# ============================================================
-
-print("SharePointDataFetcher constructor:")
-print(inspect.signature(SharePointDataFetcher))
+from sharepoint_extraction import SharePointDataFetcher
 
 fetcher = SharePointDataFetcher()
 
-print("✓ SharePointDataFetcher klaar")
-print("✓ Document Intelligence client aanwezig:", hasattr(fetcher, "docint_client"))
+KENNISBANK = "PU"
+CATEGORY = "PWRI"
+MAX_DOCUMENTS = 5
+
+print("✓ Setup klaar")
 ```
-
-### Stap 3 — Bestaande documentflow draaien
-
-Deze cell zoekt alleen naar de bestaande publieke flow; hij bouwt **geen nieuwe downloadroute**.
 
 ```python
 # ============================================================
-# 3. BESTAANDE DOCUMENTFLOW GEBRUIKEN
+# 2. BESTAANDE METADATA OPHALEN — GEEN DATUMFILTER
 # ============================================================
 
-preferred_entrypoints = [
-    "fetch",
-    "load",
-    "load_data",
-    "fetch_data",
-    "process",
-    "process_data",
-    "get_data",
-]
-
-entrypoint = next(
-    (
-        name
-        for name in preferred_entrypoints
-        if hasattr(fetcher, name) and callable(getattr(fetcher, name))
-    ),
-    None,
+metadata = fetcher.get_indexable_source_metadata(
+    KENNISBANK,
+    CATEGORY,
 )
 
-if entrypoint is None:
-    available = [
-        name
-        for name in dir(fetcher)
-        if not name.startswith("_") and callable(getattr(fetcher, name))
-    ]
-    raise RuntimeError(
-        "Geen bekende publieke entrypoint gevonden.\n"
-        f"Beschikbare methods:\n{available}"
-    )
-
-print(f"✓ Bestaande entrypoint gevonden: {entrypoint}()")
-
-getattr(fetcher, entrypoint)()
+items = list(metadata.values())
 
 documents = [
     item
-    for item in getattr(fetcher, "data_to_be_processed", [])
+    for item in items
+    if item.get("file_type") == "document"
+][:MAX_DOCUMENTS]
+
+print(f"Metadata-items : {len(items)}")
+print(f"Testdocumenten : {len(documents)}")
+
+if not documents:
+    raise RuntimeError("Geen documenten gevonden in de bestaande metadata.")
+```
+
+```python
+# ============================================================
+# 3. BESTAANDE DOWNLOADROUTE GEBRUIKEN
+# ============================================================
+
+fetcher.data_to_be_processed = documents
+fetcher._batch_download_documents()
+
+documents = [
+    item
+    for item in fetcher.data_to_be_processed
     if item.get("temp_ref")
 ]
 
-print(f"✓ Documenten beschikbaar: {len(documents)}")
+print(f"✓ Gedownload: {len(documents)} documenten")
+
+if not documents:
+    raise RuntimeError("Geen documenten succesvol gedownload.")
 ```
-
-### Stap 4 — Document Intelligence-tabellen inventariseren
-
-Dit is feitelijk jouw spike: we pakken dezelfde `prebuilt-layout` call, maar kijken nu naar `result.tables` in plaats van alleen `result.content`.
 
 ```python
 # ============================================================
 # 4. DOCUMENT INTELLIGENCE — TABLE INVENTORY
 # ============================================================
 
-inventory = []
+rows = []
 
-for document_index, item in enumerate(documents, start=1):
+for item in documents:
 
     document_name = (
         item.get("name")
         or item.get("title")
-        or item.get("filename")
+        or item.get("source_page")
         or item.get("temp_ref")
     )
 
-    try:
-        with open(item["temp_ref"], "rb") as f:
-            result = fetcher.docint_client.begin_analyze_document(
-                "prebuilt-layout",
-                body=f,
-                output_content_format=DocumentContentFormat.MARKDOWN,
-            ).result()
+    with open(item["temp_ref"], "rb") as f:
+        result = fetcher.docint_client.begin_analyze_document(
+            "prebuilt-layout",
+            body=f,
+        ).result()
 
-        for table_index, table in enumerate(result.tables or [], start=1):
+    for table_nr, table in enumerate(result.tables or [], start=1):
 
-            cells = table.cells or []
+        cells = table.cells or []
 
-            inventory.append({
-                "document": document_name,
-                "table": table_index,
-                "rows": table.row_count,
-                "columns": table.column_count,
-                "cells": len(cells),
+        rows.append({
+            "document": document_name,
+            "table": table_nr,
+            "rows": table.row_count,
+            "columns": table.column_count,
+            "cells": len(cells),
 
-                "header_cells": sum(
-                    getattr(cell, "kind", None)
-                    in {"columnHeader", "rowHeader", "stubHead"}
-                    for cell in cells
-                ),
+            "headers": sum(
+                "header" in str(getattr(cell, "kind", "")).lower()
+                for cell in cells
+            ),
 
-                "merged_cells": sum(
-                    (getattr(cell, "row_span", 1) or 1) > 1
-                    or (getattr(cell, "column_span", 1) or 1) > 1
-                    for cell in cells
-                ),
+            "merged_cells": sum(
+                (getattr(cell, "row_span", 1) or 1) > 1
+                or (getattr(cell, "column_span", 1) or 1) > 1
+                for cell in cells
+            ),
 
-                "empty_cells": sum(
-                    not (getattr(cell, "content", "") or "").strip()
-                    for cell in cells
-                ),
-            })
-
-        print(
-            f"[{document_index}/{len(documents)}] "
-            f"{document_name}: {len(result.tables or [])} tabel(len)"
-        )
-
-    except Exception as exc:
-        print(f"SKIP — {document_name}: {exc}")
+            "empty_cells": sum(
+                not (getattr(cell, "content", "") or "").strip()
+                for cell in cells
+            ),
+        })
 
 
-tables_df = pd.DataFrame(inventory)
-
-print("\n✓ Document Intelligence analyse afgerond")
+tables_df = pd.DataFrame(rows)
 ```
-
-### Stap 5 — Resultaat en eerste impactsignalen
 
 ```python
 # ============================================================
-# 5. RESULTAAT — QUICK SCAN
+# 5. RESULTAAT + EERSTE IMPACTSIGNALEN
 # ============================================================
 
-print("=" * 72)
-print("DOCUMENT INTELLIGENCE — TABLE IMPACT QUICK SCAN")
-print("=" * 72)
+print("=" * 70)
+print("DOCUMENT INTELLIGENCE — TABLE QUICK SCAN")
+print("=" * 70)
 
-print(f"Documenten bekeken : {len(documents)}")
-print(f"Tabellen gevonden  : {len(tables_df)}")
+print(f"Documenten onderzocht : {len(documents)}")
+print(f"Tabellen gevonden     : {len(tables_df)}")
 
 if tables_df.empty:
-
-    print("\nGeen tabellen gevonden.")
+    print("\nGeen tabellen gevonden in deze sample.")
 
 else:
-
     display(tables_df)
 
     print("\nSNELLE SIGNALEN")
-    print("-" * 40)
+    print("-" * 45)
 
-    print(f"Grootste tabel           : {tables_df['rows'].max()} rijen")
-    print(f"Meeste kolommen          : {tables_df['columns'].max()}")
-    print(f"Tabellen met headers     : {(tables_df['header_cells'] > 0).sum()}")
-    print(f"Tabellen met merged cells: {(tables_df['merged_cells'] > 0).sum()}")
-    print(f"Tabellen met lege cellen : {(tables_df['empty_cells'] > 0).sum()}")
+    print(f"Grootste tabel        : {tables_df['rows'].max()} rijen")
+    print(f"Meeste kolommen       : {tables_df['columns'].max()}")
+    print(f"Met headers           : {(tables_df['headers'] > 0).sum()}")
+    print(f"Met merged cells      : {(tables_df['merged_cells'] > 0).sum()}")
+    print(f"Met lege cellen       : {(tables_df['empty_cells'] > 0).sum()}")
 
-    print("\nEERSTE IMPACT OP DE PIPELINE")
-    print("-" * 40)
-    print("1. Grote tabellen kunnen invloed hebben op chunk-grootte.")
-    print("2. Merged cells / complexe headers kunnen structuur verliezen bij flattening.")
-    print("3. Lege cellen moeten onderscheiden blijven van 0 of '-'.")
-    print("4. Headers/context moeten waarschijnlijk behouden blijven in table-nodes.")
-    print("5. Werkelijke tabelvormen bepalen of 'atomic table block' praktisch blijft.")
+    print("\nIMPACT VOOR VERVOLGONDERZOEK")
+    print("-" * 45)
+
+    print("1. Tabelomvang vs. huidige chunk size / atomic-block aanpak.")
+    print("2. Headers moeten bij tabel- of rijnodes behouden blijven.")
+    print("3. Merged cells kunnen betekenis verliezen bij simpele flattening.")
+    print("4. Lege cellen moeten onderscheiden blijven van 0 en '-'.")
+    print("5. Tabelcontext moet behouden blijven richting retrieval en LLM.")
 ```
 
-Dit is nu de notebook die ik zou bewaren als jouw **junior-DS spike**. Geen Git, geen repo-routing, geen handmatige documentpaden en geen productiecode wijzigen.
+Dit sluit nu ook aan op wat je laatste screenshots daadwerkelijk bewijzen: `get_indexable_source_metadata(kennisbank, category)` bouwt de volledige metadata zonder incremental-datumfilter, `_batch_download_documents()` werkt op `self.data_to_be_processed` en vult `temp_ref`, en daarna kunnen we direct naar de bestaande `docint_client`.
 
-Als stap 2 of 3 nog één fout geeft, hoef je daarna ook niet opnieuw het hele ontwerp te veranderen: die fout vertelt ons exact welke bestaande constructor/entrypoint jouw gekopieerde klasse gebruikt.
+**Dit is de spike.** Geen extra infrastructuur meer.
