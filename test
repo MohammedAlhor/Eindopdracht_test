@@ -1,43 +1,109 @@
-from datetime import date, timedelta
+# ============================================================
+# BIG STEP: bestaande candidates -> 3 documenten -> DI tables
+# ============================================================
 
-# Gebruik de site-context die al bewezen werkt
-kennisbank = "PU"
-category = "PWRI"
+from pathlib import Path
+import pandas as pd
 
-documents = []
+# 1. Pak maximaal 3 PDF/DOCX-documenten uit wat al is opgehaald
+sample = []
 
-# Zoek terug in de tijd, maar stop zodra we 3 documenten hebben
-for days_back in range(1, 31):
-
-    sync_date = date.today() - timedelta(days=days_back)
-
-    print(f"Check {sync_date}...")
-
-    processed, skipped = fetcher.retrieve_sharepoint_data_incremental(
-        kennisbank=kennisbank,
-        category=category,
-        sync_date=sync_date,
+for item in fetcher.data_candidates:
+    ref = (
+        item.get("file_ref")
+        or item.get("FileRef")
+        or item.get("path")
+        or item.get("name")
+        or ""
     )
 
-    found = [
-        item
-        for item in fetcher.data_to_be_processed
-        if item.get("temp_ref")
-    ]
+    if Path(str(ref)).suffix.lower() in {".pdf", ".docx"}:
+        sample.append(item)
 
-    documents.extend(found)
-
-    # duplicaten eruit
-    documents = list({
-        item["temp_ref"]: item
-        for item in documents
-    }.values())
-
-    if len(documents) >= 3:
-        documents = documents[:3]
+    if len(sample) == 3:
         break
 
-print(f"\n✓ Testset klaar: {len(documents)} documenten")
+print(f"Sample: {len(sample)} documenten")
 
-for i, item in enumerate(documents, 1):
-    print(i, item.get("name") or item.get("title") or item.get("temp_ref"))
+if not sample:
+    raise RuntimeError("Geen PDF/DOCX gevonden in data_candidates")
+
+
+# 2. Gebruik de bestaande project-downloader
+download_result = fetcher._batch_download_documents(sample)
+
+# Sommige versies muteren sample in-place, andere geven items terug
+if download_result:
+    sample = download_result
+
+documents = [
+    item for item in sample
+    if item.get("temp_ref")
+]
+
+print(f"Gedownload: {len(documents)} documenten")
+
+if not documents:
+    raise RuntimeError("Downloadroute leverde geen temp_ref op")
+
+
+# 3. Direct door dezelfde Document Intelligence-client
+rows = []
+
+for item in documents:
+    name = (
+        item.get("name")
+        or item.get("title")
+        or item.get("temp_ref")
+    )
+
+    with open(item["temp_ref"], "rb") as f:
+        result = fetcher.docint_client.begin_analyze_document(
+            "prebuilt-layout",
+            body=f,
+        ).result()
+
+    for table_nr, table in enumerate(result.tables or [], start=1):
+        cells = table.cells or []
+
+        rows.append({
+            "document": name,
+            "table": table_nr,
+            "rows": table.row_count,
+            "columns": table.column_count,
+            "cells": len(cells),
+            "headers": sum(
+                getattr(c, "kind", None) in
+                {"columnHeader", "rowHeader", "stubHead"}
+                for c in cells
+            ),
+            "merged_cells": sum(
+                (getattr(c, "row_span", 1) or 1) > 1
+                or (getattr(c, "column_span", 1) or 1) > 1
+                for c in cells
+            ),
+            "empty_cells": sum(
+                not (getattr(c, "content", "") or "").strip()
+                for c in cells
+            ),
+        })
+
+
+# 4. Resultaat
+tables_df = pd.DataFrame(rows)
+
+print("\n" + "=" * 60)
+print("DOCUMENT INTELLIGENCE TABLE SCAN")
+print("=" * 60)
+print(f"Documenten: {len(documents)}")
+print(f"Tabellen   : {len(tables_df)}")
+
+display(tables_df)
+
+if not tables_df.empty:
+    print("\nSNELLE SIGNALEN")
+    print("Grootste tabel       :", tables_df["rows"].max(), "rijen")
+    print("Meeste kolommen      :", tables_df["columns"].max())
+    print("Met headers          :", (tables_df["headers"] > 0).sum())
+    print("Met merged cells     :", (tables_df["merged_cells"] > 0).sum())
+    print("Met lege cellen      :", (tables_df["empty_cells"] > 0).sum())
